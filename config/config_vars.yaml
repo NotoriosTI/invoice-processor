@@ -1,0 +1,31 @@
+variables:
+  ODOO_URL:
+    source: ODOO_URL
+    type: str
+  ODOO_DB:
+    source: ODOO_DB
+    type: str
+  ODOO_USERNAME:
+    source: ODOO_USERNAME
+    type: str
+  ODOO_PASSWORD:
+    source: ODOO_PASSWORD
+    type: str
+  OPENAI_API_KEY:
+    source: OPENAI_API_KEY
+    type: str
+  OPENAI_MODEL:
+    source: OPENAI_MODEL
+    type: str
+    default: "gpt-4o-mini"
+
+validation:
+  required:
+    - ODOO_URL
+    - ODOO_DB
+    - ODOO_USERNAME
+    - ODOO_PASSWORD
+    - OPENAI_API_KEY
+  optional:
+    - OPENAI_MODEL
+  strict: false
