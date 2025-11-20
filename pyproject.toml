@@ -18,6 +18,7 @@ dependencies = [
   "odoo-engine @ git+https://github.com/NotoriosTI/libraries.git@main#subdirectory=odoo-engine",
   "slack-api @ git+https://github.com/NotoriosTI/libraries.git@main#subdirectory=slack-api",
   "dev-utils @ git+https://github.com/NotoriosTI/libraries.git@main#subdirectory=dev-utils",
+  "env-manager @ git+https://github.com/NotoriosTI/libraries.git@dev#subdirectory=env-manager",
   "google-cloud-secret-manager (>=2.24.0,<3.0.0)",
   "openai (>=1.91.0,<2.0.0)",
   "pytest (>=8.4.1,<9.0.0)",
