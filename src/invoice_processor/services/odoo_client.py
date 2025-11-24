@@ -1,19 +1,21 @@
 from typing import Any, Dict, Optional
 import requests
+
 from ..config import get_settings
+
 
 class OdooClient:
     def __init__(self):
         settings = get_settings()
-        self.base_url = settings.odoo_url.rstrip('/')
+        self.base_url = settings.odoo_url.rstrip("/")
         self.db = settings.odoo_db
         self.username = settings.odoo_username
         self.password = settings.odoo_password
-        self.sesion = requests.Session()
-        self.session.headers.update({'Content-Type': 'application/json'})
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
         self._auth_token: Optional[str] = None
 
-    def authenticate(self):
+    def _authenticate(self):
         if self._auth_token:
             return
         resp = self.session.post(
@@ -24,7 +26,7 @@ class OdooClient:
         resp.raise_for_status()
         token = resp.json()["token"]
         self._auth_token = token
-        self.session.headers.update["Authorization"] = f"Bearer {token}"
+        self.session.headers.update({"Authorization": f"Bearer {token}"})
 
     def find_product(self, sku: Optional[str], name: str) -> Optional[Dict[str, Any]]:
         self._authenticate()
