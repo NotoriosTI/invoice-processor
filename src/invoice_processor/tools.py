@@ -1,13 +1,13 @@
 from typing import List
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-from .models import InvoiceData, ProcessedProduct
+from .models import InvoiceData, InvoiceResponseModel
 from .processor import extract_invoice_data, process_invoice_file
 
 class ParseInvoiceArgs(BaseModel):
     image_path: str = Field(..., description = "Ruta local del archivo PNG/JPG")
 
-class UpsertInvoiceArgs(BaseModel):
+class ProcessInvoiceArgs(BaseModel):
     image_path: str = Field(..., description = "Ruta local del archivo a procesar")
 
 
@@ -16,9 +16,9 @@ def parse_invoice_image(image_path: str) -> InvoiceData:
     """Extrae los datos estructurados de la factura"""
     return extract_invoice_data(image_path)
 
-@tool("upsert_invoice_inventory", args_schema = UpsertInvoiceArgs)
-def upsert_invoice_inventory(image_path: str) -> List[ProcessedProduct]:
-    """Crea/actualiza productos en Odoo y ajusta inventario segùn la factura."""
+@tool("process_invoice_purchase_flow", args_schema = ProcessInvoiceArgs)
+def process_invoice_purchase_flow(image_path: str) -> InvoiceResponseModel:
+    """Procesa la factura completa: identifica cotización, genera orden de compra y valida recepciones"""
     return process_invoice_file(image_path)
 
 @tool("request_human_input")

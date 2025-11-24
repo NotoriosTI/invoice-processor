@@ -1,10 +1,11 @@
 import argparse
 from uuid import uuid4
 from langchain_core.messages import SystemMessage, HumanMessage
+
 from .agent import invoice_agent
 from .prompts import INVOICE_PROMPT
 from .slack_handler import run_slack_bot
-from .config import get_settings
+
 
 def console_main():
     thread_id = f"console-{uuid4()}"
@@ -16,22 +17,27 @@ def console_main():
         is_new = state is None or not state.values.get("messages")
 
         messages = (
-            [SystemMessage(content = INVOICE_PROMPT), HumanMessage(content = text)]
-            if is_new else [HumanMessage(content = text)]
+            [SystemMessage(content=INVOICE_PROMPT), HumanMessage(content=text)]
+            if is_new else [HumanMessage(content=text)]
         )
 
-        result = invoice_agent.invoke({"messages": messages}, config = config)
-        print(result.structured_response.summary if hasattr(result, "structured_response") else result)
+        result = invoice_agent.invoke({"messages": messages}, config=config)
+        if hasattr(result, "structured_response"):
+            print(result.structured_response.summary)
+        else:
+            print(result)
+
 
 def main():
-    parse = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices = ["console", "slack"], default = "console")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["console", "slack"], default="console")
     args = parser.parse_args()
 
-    if arg.mode == "slack":
+    if args.mode == "slack":
         run_slack_bot()
     else:
         console_main()
+
 
 if __name__ == "__main__":
     main()
