@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import Dict, List
 from dev_utils.pretty_logger import PrettyLogger
 
 from .services.ocr import InvoiceOcrClient
@@ -12,11 +12,11 @@ odoo_client = OdooClient()
 
 
 def extract_invoice_data(image_path: str) -> InvoiceData:
-    """
-    Ejecuta OCR sobre la imagen y valida el resultado contra InvoiceData.
-    """
+    """Lanza el OCR y valida que el resultado cumpla con nuestro esquema."""
     logger.info(f"Extrayendo datos de la factura {image_path}")
     raw = ocr_client.extract(image_path)
+    if isinstance(raw, dict) and raw.get("error"):
+        raise ValueError(f"OCR inválido: {raw['error']}")
     return (
         InvoiceData.model_validate_json(raw)
         if isinstance(raw, str)
@@ -24,8 +24,10 @@ def extract_invoice_data(image_path: str) -> InvoiceData:
     )
 
 
+
 def _match_quote(invoice: InvoiceData) -> Dict:
-    reference = invoice.lines[0].quote_reference if invoice.lines else None
+    """Ubica la cotización/orden asociada usando proveedor + referencia del documento."""
+    reference = invoice.document_reference or invoice.invoice_id
     quote = odoo_client.find_quote(invoice.supplier or "", invoice.invoice_id, reference)
     if not quote:
         raise ValueError("No pude encontrar una cotización relacionada con la factura.")
@@ -34,6 +36,7 @@ def _match_quote(invoice: InvoiceData) -> Dict:
 
 
 def _ensure_purchase_order(quote: Dict) -> Dict:
+    """Confirma la cotización si sigue en borrador para trabajar con la orden de compra real."""
     if quote.get("state") == "purchase":
         logger.info("La cotización %s ya es orden de compra.", quote.get("name"))
         return quote
@@ -42,6 +45,7 @@ def _ensure_purchase_order(quote: Dict) -> Dict:
 
 
 def _collect_receipt_data(order: Dict) -> Dict[str, Dict]:
+    """Consulta las recepciones vinculadas a la orden y las indexa por producto."""
     receipt = odoo_client.get_receipts_for_order(order["id"])
     result: Dict[str, Dict] = {}
     for line in receipt.get("lines", []):
@@ -57,16 +61,19 @@ def _collect_receipt_data(order: Dict) -> Dict[str, Dict]:
     return result
 
 
+def _match_product(line: InvoiceLine, receipt_map: Dict[str, Dict]) -> Dict | None:
+    """Hace matching por nombre o SKU para alinear la línea de factura con la recepción."""
+    for data in receipt_map.values():
+        if data["product_name"] == line.product_name:
+            return data
+        if line.sku and data["sku"] == line.sku:
+            return data
+    return None
+
+
 def _verify_line(line: InvoiceLine, receipt_map: Dict[str, Dict]) -> ProcessedProduct:
-    matched_receipt = next(
-        (
-            data
-            for data in receipt_map.values()
-            if data["product_name"] == line.product_name
-            or data["sku"] == line.sku
-        ),
-        None,
-    )
+    """Compara cantidad y ubicación del producto entre la factura y la recepción Odoo."""
+    matched_receipt = _match_product(line, receipt_map)
 
     if not matched_receipt:
         return ProcessedProduct(
@@ -103,9 +110,7 @@ def _verify_line(line: InvoiceLine, receipt_map: Dict[str, Dict]) -> ProcessedPr
 
 
 def process_invoice_file(image_path: str) -> InvoiceResponseModel:
-    """
-    Orquesta la lectura de la factura, identificación de cotización y validación de recepciones.
-    """
+    """Flujo principal: OCR → match de cotización → validación de recepción y resumen final."""
     invoice = extract_invoice_data(image_path)
     quote = _match_quote(invoice)
     purchase_order = _ensure_purchase_order(quote)
