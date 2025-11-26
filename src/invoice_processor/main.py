@@ -1,8 +1,14 @@
+import logging
+logging.getLogger("langchain").setLevel(logging.ERROR)
+logging.getLogger("langgraph").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
 import argparse
 from uuid import uuid4
 from langchain_core.messages import SystemMessage, HumanMessage
-from .agent import invoice_agent
-from .prompts import INVOICE_PROMPT
+from .agent import invoice_agent, invoice_reader_agent
+from .prompts import INVOICE_PROMPT, INVOICE_READER_PROMPT
 from .slack_handler import run_slack_bot
 
 
@@ -26,14 +32,36 @@ def console_main():
         else:
             print(result)
 
+def reader_main(image_path: str):
+    """Ejecuta el agente de lectura simple sobre una única imagen."""
+    thread_id = f"reader-{uuid4()}"
+    config = {"configurable": {"thread_id": thread_id}}
+    message_text = (
+        "Lee la factura ubicada en '{path}'. "
+        "Llama a parse_invoice_image(image_path='{path}') y devuelve los datos extraídos."
+    ).format(path=image_path)
+    messages = [
+        SystemMessage(content=INVOICE_READER_PROMPT),
+        HumanMessage(content=message_text),
+    ]
+    result = invoice_reader_agent.invoke({"messages": messages}, config=config)
+    if hasattr(result, "model_dump_json"):
+        print(result.model_dump_json(indent=2))
+    else:
+        print(result)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["console", "slack"], default="console")
+    parser.add_argument("--mode", choices=["console", "slack", "reader"], default="console")
+    parser.add_argument("--image", help="Ruta de la factura a leer (solo modo reader)")
     args = parser.parse_args()
 
     if args.mode == "slack":
         run_slack_bot()
+    elif args.mode == "reader":
+        if not args.image:
+            parser.error("--image es obligatorio cuando se usa --mode reader")
+        reader_main(args.image)
     else:
         console_main()
 

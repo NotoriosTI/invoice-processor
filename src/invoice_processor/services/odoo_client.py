@@ -80,3 +80,17 @@ class OdooClient:
         )
         resp.raise_for_status()
         return resp.json().get("type", "producto")
+
+    def fetch_purchase_summary(self, invoice_payload: dict) -> Dict[str, Any]:
+        """
+        Recibe un payload con los campos de la factura y devuelve la informacion equivalente en Odoo
+        El endpoint debe responder con rl neto, iva, total y una lista de lineas(detalle, cantidad, precio_unitario, subtotal)
+        """
+        self._authenticate()
+        resp = self.session.post(
+            f"{self.base_url}/api/purchase/match_invoice",
+            json=invoice_payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()

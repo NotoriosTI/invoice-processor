@@ -1,10 +1,10 @@
 from typing import Dict, List
 from dev_utils.pretty_logger import PrettyLogger
+from pydantic import ValidationError
 
 from .services.ocr import InvoiceOcrClient
 from .services.odoo_client import OdooClient
 from .models import InvoiceData, InvoiceLine, ProcessedProduct, InvoiceResponseModel
-
 
 logger = PrettyLogger(service_name="processor")
 ocr_client = InvoiceOcrClient()
@@ -12,130 +12,116 @@ odoo_client = OdooClient()
 
 
 def extract_invoice_data(image_path: str) -> InvoiceData:
-    """Lanza el OCR y valida que el resultado cumpla con nuestro esquema."""
     logger.info(f"Extrayendo datos de la factura {image_path}")
     raw = ocr_client.extract(image_path)
     if isinstance(raw, dict) and raw.get("error"):
         raise ValueError(f"OCR inválido: {raw['error']}")
-    return (
-        InvoiceData.model_validate_json(raw)
-        if isinstance(raw, str)
-        else InvoiceData.model_validate(raw)
-    )
+    try:
+        return (
+            InvoiceData.model_validate_json(raw)
+            if isinstance(raw, str)
+            else InvoiceData.model_validate(raw)
+        )
+    except ValidationError as exc:
+        raise ValueError(f"OCR no coincide con el formato esperado: {exc}") from exc
 
 
-
-def _match_quote(invoice: InvoiceData) -> Dict:
-    """Ubica la cotización/orden asociada usando proveedor + referencia del documento."""
-    reference = invoice.document_reference or invoice.invoice_id
-    quote = odoo_client.find_quote(invoice.supplier or "", invoice.invoice_id, reference)
-    if not quote:
-        raise ValueError("No pude encontrar una cotización relacionada con la factura.")
-    logger.info("Se encontró la cotización %s", quote.get("name"))
-    return quote
-
-
-def _ensure_purchase_order(quote: Dict) -> Dict:
-    """Confirma la cotización si sigue en borrador para trabajar con la orden de compra real."""
-    if quote.get("state") == "purchase":
-        logger.info("La cotización %s ya es orden de compra.", quote.get("name"))
-        return quote
-    logger.info("Confirmando cotización %s para generar orden de compra.", quote.get("name"))
-    return odoo_client.confirm_quote(quote["id"])
-
-
-def _collect_receipt_data(order: Dict) -> Dict[str, Dict]:
-    """Consulta las recepciones vinculadas a la orden y las indexa por producto."""
-    receipt = odoo_client.get_receipts_for_order(order["id"])
-    result: Dict[str, Dict] = {}
-    for line in receipt.get("lines", []):
-        product_id = line["product_id"]
-        result[product_id] = {
-            "product_id": product_id,
-            "product_name": line["product_name"],
-            "sku": line.get("sku") or line.get("default_code"),
-            "received_qty": line.get("received_qty", 0.0),
-            "location": line.get("location"),
-            "product_type": odoo_client.get_product_type(product_id),
-        }
-    return result
+def _fetch_purchase_summary(invoice: InvoiceData) -> Dict:
+    """
+    Solicita a Odoo los datos equivalentes (cabecera y líneas).
+    Se espera que el endpoint retorne:
+    {
+        "neto": float,
+        "iva_19": float,
+        "total": float,
+        "lines": [
+            {"detalle": str, "cantidad": float, "precio_unitario": float, "subtotal": float}
+        ]
+    }
+    """
+    payload = {
+        "neto": invoice.neto,
+        "iva_19": invoice.iva_19,
+        "total": invoice.total,
+        "lines": [line.model_dump() for line in invoice.lines],
+    }
+    return odoo_client.fetch_purchase_summary(payload)
 
 
-def _match_product(line: InvoiceLine, receipt_map: Dict[str, Dict]) -> Dict | None:
-    """Hace matching por nombre o SKU para alinear la línea de factura con la recepción."""
-    for data in receipt_map.values():
-        if data["product_name"] == line.product_name:
-            return data
-        if line.sku and data["sku"] == line.sku:
-            return data
+def _match_line(invoice_line: InvoiceLine, odoo_lines: List[Dict]) -> Dict | None:
+    for line in odoo_lines:
+        if line["detalle"].strip().lower() == invoice_line.detalle.strip().lower():
+            return line
     return None
 
 
-def _verify_line(line: InvoiceLine, receipt_map: Dict[str, Dict]) -> ProcessedProduct:
-    """Compara cantidad y ubicación del producto entre la factura y la recepción Odoo."""
-    matched_receipt = _match_product(line, receipt_map)
-
-    if not matched_receipt:
+def _verify_line(invoice_line: InvoiceLine, odoo_lines: List[Dict]) -> ProcessedProduct:
+    odoo_line = _match_line(invoice_line, odoo_lines)
+    if not odoo_line:
         return ProcessedProduct(
-            action="receipt_issue",
-            product_name=line.product_name,
-            sku=line.sku or "N/A",
-            invoice_quantity=line.quantity,
-            issues="No se encontró recepción para este producto.",
+            detalle=invoice_line.detalle,
+            cantidad_match=False,
+            precio_match=False,
+            subtotal_match=False,
+            issues="Producto no encontrado en la orden de compra.",
         )
 
-    odoo_qty = matched_receipt["received_qty"]
-    product_type = matched_receipt["product_type"]
-    expected_location = "Materia Prima" if product_type == "materia_prima" else "Productos Terminados"
-    location_found = matched_receipt.get("location")
+    cantidad_match = abs(odoo_line["cantidad"] - invoice_line.cantidad) <= 0.01
+    precio_match = abs(odoo_line["precio_unitario"] - invoice_line.precio_unitario) <= 0.01
+    subtotal_match = abs(odoo_line["subtotal"] - invoice_line.subtotal) <= 0.5
 
-    issues = []
-    if abs(odoo_qty - line.quantity) > 0.01:
-        issues.append(f"Cantidad en Odoo ({odoo_qty}) no coincide con la factura ({line.quantity}).")
-    if location_found and location_found != expected_location:
-        issues.append(f"Ubicación actual '{location_found}' no coincide con '{expected_location}'.")
-
-    action = "receipt_verified" if not issues else "receipt_issue"
+    issues: list[str] = []
+    if not cantidad_match:
+        issues.append(
+            f"CANT: factura {invoice_line.cantidad} vs Odoo {odoo_line['cantidad']}."
+        )
+    if not precio_match:
+        issues.append(
+            f"P. UNITARIO: factura {invoice_line.precio_unitario} vs Odoo {odoo_line['precio_unitario']}."
+        )
+    if not subtotal_match:
+        issues.append(
+            f"Subtotal línea: factura {invoice_line.subtotal} vs Odoo {odoo_line['subtotal']}."
+        )
 
     return ProcessedProduct(
-        action=action,
-        product_name=line.product_name,
-        sku=matched_receipt["sku"] or line.sku or "N/A",
-        invoice_quantity=line.quantity,
-        odoo_quantity=odoo_qty,
-        location_expected=expected_location,
-        location_found=location_found,
+        detalle=invoice_line.detalle,
+        cantidad_match=cantidad_match,
+        precio_match=precio_match,
+        subtotal_match=subtotal_match,
         issues=" ".join(issues) if issues else None,
     )
 
 
 def process_invoice_file(image_path: str) -> InvoiceResponseModel:
-    """Flujo principal: OCR → match de cotización → validación de recepción y resumen final."""
     invoice = extract_invoice_data(image_path)
-    quote = _match_quote(invoice)
-    purchase_order = _ensure_purchase_order(quote)
-    receipt_map = _collect_receipt_data(purchase_order)
+    purchase_data = _fetch_purchase_summary(invoice)
 
-    products = [_verify_line(line, receipt_map) for line in invoice.lines]
+    products = [
+        _verify_line(line, purchase_data.get("lines", []))
+        for line in invoice.lines
+    ]
+
+    neto_match = abs(purchase_data["neto"] - invoice.neto) <= 0.5
+    iva_match = abs(purchase_data["iva_19"] - invoice.iva_19) <= 0.5
+    total_match = abs(purchase_data["total"] - invoice.total) <= 0.5
 
     summary_lines = [
-        f"Cotización: {quote.get('name')} | Orden de compra: {purchase_order.get('name')}"
+        f"Neto: {'OK' if neto_match else 'ISSUE'} (Factura {invoice.neto}, Odoo {purchase_data['neto']})",
+        f"19% IVA: {'OK' if iva_match else 'ISSUE'} (Factura {invoice.iva_19}, Odoo {purchase_data['iva_19']})",
+        f"Total: {'OK' if total_match else 'ISSUE'} (Factura {invoice.total}, Odoo {purchase_data['total']})",
     ]
     for product in products:
         status = "OK" if not product.issues else "ISSUE"
-        summary_lines.append(
-            f"- {product.product_name} ({product.sku}): {status} "
-            f"(Factura: {product.invoice_quantity}, Odoo: {product.odoo_quantity})"
-        )
+        summary_lines.append(f"- {product.detalle}: {status}")
         if product.issues:
             summary_lines.append(f"  → {product.issues}")
 
-    summary = "\n".join(summary_lines)
-
     return InvoiceResponseModel(
-        summary=summary,
-        quote_id=quote.get("name"),
-        purchase_order_id=purchase_order.get("name"),
+        summary="\n".join(summary_lines),
         products=products,
-        needs_follow_up=any(prod.issues for prod in products),
+        needs_follow_up=any(p.issues for p in products) or not (neto_match and iva_match and total_match),
+        neto_match=neto_match,
+        iva_match=iva_match,
+        total_match=total_match,
     )

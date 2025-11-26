@@ -1,6 +1,6 @@
 [project]
 name = "invoice-processor"
-version = "5.0.2"
+version = "beta"
 description = ""
 authors = [{ name = "Tomàs Nùñez Montagna", email = "ti@notorios.cl" }]
 readme = "README.md"
