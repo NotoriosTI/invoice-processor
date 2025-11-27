@@ -33,6 +33,7 @@ INVOICE_OCR_PROMPT = (
     "Eres experto en facturas chilenas. Responde únicamente JSON válido. "
     "Formato esperado:\n"
     "{\n"
+    '  "supplier_name": str?,\n'
     '  "neto": number,\n'
     '  "iva_19": number,\n'
     '  "total": number,\n'
@@ -42,3 +43,4 @@ INVOICE_OCR_PROMPT = (
     "}\n"
     'Si no puedes leer la imagen, responde {"error": "no_data"}. No añadas texto adicional.'
 )
+
