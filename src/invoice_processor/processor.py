@@ -174,3 +174,31 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         total_match=total_match,
     )
 
+LINE_TOLERANCE = 0.5
+HEADER_TOLERANCE = 0.5
+
+def _validate_invoice(invoice: InvoiceData) -> None:
+    """Valida que las líneas y los totales del OCR sean coherentes antes de buscar la OC."""
+    if not invoice.lines:
+        raise ValueError("La factura no contiene líneas de productos para comparar.")
+
+    total_subtotals = 0.0
+    for line in invoice.lines:
+        expected_subtotal = line.cantidad * line.precio_unitario
+        if abs(expected_subtotal - line.subtotal) > LINE_TOLERANCE:
+            raise ValueError(
+                "La línea '{detalle}' tiene columnas inconsistentes: "
+                "CANT × P. UNITARIO no coincide con el subtotal."
+            ).format(detalle=line.detalle)
+        total_subtotals += line.subtotal
+
+    if abs(total_subtotals - invoice.neto) > HEADER_TOLERANCE:
+        raise ValueError(
+            "La suma de subtotales ({:.2f}) no coincide con el NETO leído ({:.2f})."
+            .format(total_subtotals, invoice.neto)
+        )
+    if abs(invoice.neto + invoice.iva_19 - invoice.total) > HEADER_TOLERANCE:
+        raise ValueError(
+            "NETO + 19% IVA ({:.2f}) no coincide con el TOTAL ({:.2f})."
+            .format(invoice.neto + invoice.iva_19, invoice.total)
+        )

@@ -30,17 +30,28 @@ Instrucciones:
 """
 
 INVOICE_OCR_PROMPT = (
-    "Eres experto en facturas chilenas. Responde únicamente JSON válido. "
-    "Formato esperado:\n"
+    "Eres un experto en facturas chilenas. Responde EXCLUSIVAMENTE un JSON válido sin texto adicional.\n"
+    "Formato exacto:\n"
     "{\n"
-    '  "supplier_name": str?,\n'
+    '  "supplier_name": string|null,\n'
     '  "neto": number,\n'
     '  "iva_19": number,\n'
     '  "total": number,\n'
     '  "lines": [\n'
-    '     {"detalle": str, "cantidad": number, "precio_unitario": number, "subtotal": number}\n'
+    '     {"detalle": string, "cantidad": number, "precio_unitario": number, "subtotal": number}\n'
     "  ]\n"
     "}\n"
-    'Si no puedes leer la imagen, responde {"error": "no_data"}. No añadas texto adicional.'
+    "Instrucciones estrictas:\n"
+    "1. Identifica la fila de encabezados de la tabla (CÓDIGO | CANT. | DETALLE | P. UNITARIO | TOTAL SIN IVA) y usa solo esas columnas para extraer datos.\n"
+    "2. Recorre la tabla FILA POR FILA:\n"
+    "   • CANT. → `cantidad`. Si el texto dice \"25 KG\" o similar, toma únicamente el número (25). No conviertas unidades.\n"
+    "   • DETALLE → `detalle`. Copia el texto completo tal cual aparece (incluye códigos y descripciones, sin traducir ni resumir).\n"
+    "   • P. UNITARIO → `precio_unitario`. Interpreta los valores en pesos chilenos: elimina separadores de miles (\"8.186\" se convierte en 8186.0).\n"
+    "   • TOTAL (sin IVA) → `subtotal`. Usa exclusivamente esa columna para el monto total de la fila.\n"
+    "3. Antes de registrar cada fila, confirma que `cantidad × precio_unitario` sea igual al `subtotal` (tolerancia 0.5) y que `precio_unitario` sea menor que `subtotal`. Si no coincide, vuelve a leer la fila o coloca null en los campos dudosos en lugar de adivinar.\n"
+    "4. Extrae NETO, 19% I.V.A y TOTAL desde el recuadro inferior derecho. Verifica que la suma de los subtotales sea igual al neto y que neto + iva_19 = total. Si no cuadra, relee la factura hasta corregirlo.\n"
+    "5. Si alguna columna no es legible, escribe null para ese campo y anota mentalmente cuál falló. Nunca inventes números ni mezcles columnas.\n"
+    '6. Si la imagen está dañada o no puedes leerla, responde únicamente {"error": "no_data"}.\n'
 )
+
 

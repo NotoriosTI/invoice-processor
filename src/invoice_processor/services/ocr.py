@@ -16,8 +16,9 @@ class InvoiceOcrClient:
             model=settings.openai_model,
             openai_api_key=settings.openai_api_key,
             max_tokens=2048,
+            model_kwargs={"response_format": {"type": "json_object"}},
         )
-
+        
     @staticmethod
     def _encode_image(image_path: str) -> str:
         data = Path(image_path).read_bytes()
