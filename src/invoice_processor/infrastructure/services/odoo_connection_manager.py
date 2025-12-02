@@ -220,6 +220,7 @@ class OdooConnectionManager:
             product_info = products.get(line["product_id"][0]) if line.get("product_id") else {}
             parsed.append(
                 {
+                    "id": line["id"],
                     "detalle": product_info.get("name") or line.get("name"),
                     "sku": product_info.get("default_code"),
                     "cantidad": line.get("product_qty", 0.0),
@@ -275,9 +276,6 @@ class OdooConnectionManager:
             )
         return parsed
 
-
-
-
     def get_product_type(self, product_id: int) -> str:
         """Devuelve el tipo de producto (materia prima vs producto terminado)."""
         product = self._execute_kw(
@@ -288,5 +286,8 @@ class OdooConnectionManager:
         )[0]
         category_name = product["categ_id"][1] if product.get("categ_id") else ""
         return "materia_prima" if "Materia Prima" in category_name else "producto"
+
+    def update_order_line(self, line_id: int, values: dict) -> None:
+        self._execute_kw("purchase.order.line", "write", [[line_id], values])
 
 odoo_manager = OdooConnectionManager()

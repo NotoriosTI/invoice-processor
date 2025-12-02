@@ -106,6 +106,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     compara cabecera y líneas, verifica recepción y construye el resumen final.
     """
     invoice = extract_invoice_data(image_path)
+    _validate_invoice(invoice)
 
     if not invoice.lines:
         raise ValueError("La factura no contiene líneas de productos para comparar.")
@@ -127,24 +128,37 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     for line in invoice.lines:
         product_result = _verify_line(line, summary["lines"])
         matched_line = _match_line(line, summary["lines"])
-        if matched_line and matched_line.get("product_id"):
-            receipt_info = receipt_by_product.get(matched_line["product_id"], {})
-            # Valida cantidades recepcionadas
-            if receipt_info:
-                qty_received = float(receipt_info.get("quantity", 0.0))
-                if abs(qty_received - line.cantidad) > 0.01:
-                    extra = f"Recepción: factura {line.cantidad} vs recibido {qty_received}."
-                    product_result.issues = f"{product_result.issues or ''} {extra}".strip()
-                # Valida ubicación según tipo de producto
-                expected_location = (
-                    "Materia Prima"
-                    if odoo_manager.get_product_type(matched_line["product_id"]) == "materia_prima"
-                    else "Productos Terminados"
-                )
-                location = receipt_info.get("location")
-                if location and location != expected_location:
-                    extra = f"Ubicación '{location}' vs '{expected_location}'."
-                    product_result.issues = f"{product_result.issues or ''} {extra}".strip()
+
+        if matched_line and matched_line.get("id"):
+            desired_values: Dict[str, float] = {}
+            if not product_result.cantidad_match:
+                desired_values["product_qty"] = line.cantidad
+            if not product_result.precio_match:
+                desired_values["price_unit"] = line.precio_unitario
+            if not product_result.subtotal_match:
+                desired_values["price_subtotal"] = line.subtotal
+
+            if desired_values:
+                odoo_manager.update_order_line(matched_line["id"], desired_values)
+
+            receipt_info = receipt_by_product.get(matched_line.get("product_id"), {})
+        else:
+            receipt_info = {}
+
+        if receipt_info:
+            qty_received = float(receipt_info.get("quantity", 0.0))
+            if abs(qty_received - line.cantidad) > 0.01:
+                extra = f"Recepción: factura {line.cantidad} vs recibido {qty_received}."
+                product_result.issues = f"{product_result.issues or ''} {extra}".strip()
+            expected_location = (
+                "Materia Prima"
+                if odoo_manager.get_product_type(matched_line["product_id"]) == "materia_prima"
+                else "Productos Terminados"
+            )
+            location = receipt_info.get("location")
+            if location and location != expected_location:
+                extra = f"Ubicación '{location}' vs '{expected_location}'."
+                product_result.issues = f"{product_result.issues or ''} {extra}".strip()
 
         products.append(product_result)
 
@@ -173,6 +187,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         iva_match=iva_match,
         total_match=total_match,
     )
+
 
 LINE_TOLERANCE = 0.5
 HEADER_TOLERANCE = 0.5
