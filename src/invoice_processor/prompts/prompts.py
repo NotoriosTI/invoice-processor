@@ -41,18 +41,12 @@ INVOICE_OCR_PROMPT = (
     '     {"detalle": string, "cantidad": number, "precio_unitario": number, "subtotal": number}\n'
     "  ]\n"
     "}\n"
-    "Instrucciones estrictas:\n"
-    "1. Identifica la fila de encabezados de la tabla (CÓDIGO | CANT. | DETALLE | P. UNITARIO | TOTAL SIN IVA) y usa solo esas columnas.\n"
-    "2. Recorre la tabla FILA POR FILA:\n"
-    "   • CANT. → `cantidad` (solo el número; si dice «25 KG», toma 25).\n"
-    "   • DETALLE → `detalle`. Copia únicamente el nombre del producto que aparece en la primera línea de la celda; ignora cualquier texto adicional como “Lote…”, “Venc…”, notas u otras observaciones.\n"
-    "   • P. UNITARIO → `precio_unitario` en pesos chilenos (quita separadores de miles: «8.186» ⇒ 8186.0).\n"
-    "   • TOTAL SIN IVA → `subtotal` (monto total de la fila).\n"
-    "3. Antes de registrar cada fila, confirma que `cantidad × precio_unitario ≈ subtotal` (tolerancia 0.5) y que `precio_unitario < subtotal`. Si no coincide, vuelve a leer la fila o deja null en los campos dudosos.\n"
-    "4. Extrae NETO, 19% I.V.A y TOTAL del recuadro inferior derecho y verifica que sum(subtotales) = neto y neto + iva_19 = total.\n"
-    "5. Si una columna no es legible, usa null; nunca inventes valores ni mezcles columnas.\n"
-    '6. Si la imagen está dañada o no puedes leerla, responde únicamente {"error": "no_data"}.\n'
+    "1. Toma cada fila de la tabla (CANT | DETALLE | P. UNITARIO | TOTAL sin IVA) y copia los valores literal.\n"
+    "2. Ignora textos adicionales en la misma celda (lote, vencimiento, notas). Solo guarda el nombre del producto.\n"
+    "3. Reporta los montos en pesos chilenos; quita separadores de miles.\n"
+    "4. Si no puedes leer un dato, usa null. Si la imagen es ilegible, responde {'error': 'no_data'}.\n"
 )
+
 
 
 

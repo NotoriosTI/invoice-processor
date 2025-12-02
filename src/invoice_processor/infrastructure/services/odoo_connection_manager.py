@@ -290,4 +290,23 @@ class OdooConnectionManager:
     def update_order_line(self, line_id: int, values: dict) -> None:
         self._execute_kw("purchase.order.line", "write", [[line_id], values])
 
+    def recompute_order_amounts(self, order_id: int) -> None:
+        """Recalcula los totales usando la lógica estándar de Odoo."""
+        self._execute_kw(
+            "purchase.order",
+            "write",
+            [[order_id], {}],
+        )
+
+    def mark_order_as_invoiced(self, order_id: int) -> None:
+        """Coloca la orden en estado 'facturado' (o el equivalente en tu instancia)."""
+        self._execute_kw(
+            "purchase.order",
+            "write",
+            [[order_id], {"state": "done"}],
+        )
+
+
+
+    
 odoo_manager = OdooConnectionManager()

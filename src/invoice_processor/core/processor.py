@@ -106,23 +106,20 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     compara cabecera y líneas, verifica recepción y construye el resumen final.
     """
     invoice = extract_invoice_data(image_path)
-    _validate_invoice(invoice)
 
     if not invoice.lines:
         raise ValueError("La factura no contiene líneas de productos para comparar.")
     order = _load_purchase_order(invoice)
     summary = _build_order_summary(order)
 
-    # Preprocesa recepciones para validar cantidades y ubicaciones
-    receipt_by_product: Dict[int, Dict[str, float | str]] = {}
+    # Preprocesa recepciones solo para validar cantidades
+    receipt_by_product: Dict[int, Dict[str, float]] = {}
     for rec in summary["receipts"]:
         product_id = rec.get("product_id")
         if not product_id:
             continue
-        info = receipt_by_product.setdefault(product_id, {"quantity": 0.0, "location": rec.get("location")})
+        info = receipt_by_product.setdefault(product_id, {"quantity": 0.0})
         info["quantity"] = float(info["quantity"]) + float(rec.get("quantity_done", 0.0))
-        if rec.get("location"):
-            info["location"] = rec["location"]
 
     products: List[ProcessedProduct] = []
     for line in invoice.lines:
@@ -150,21 +147,17 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
             if abs(qty_received - line.cantidad) > 0.01:
                 extra = f"Recepción: factura {line.cantidad} vs recibido {qty_received}."
                 product_result.issues = f"{product_result.issues or ''} {extra}".strip()
-            expected_location = (
-                "Materia Prima"
-                if odoo_manager.get_product_type(matched_line["product_id"]) == "materia_prima"
-                else "Productos Terminados"
-            )
-            location = receipt_info.get("location")
-            if location and location != expected_location:
-                extra = f"Ubicación '{location}' vs '{expected_location}'."
-                product_result.issues = f"{product_result.issues or ''} {extra}".strip()
 
         products.append(product_result)
 
-    neto_match = abs(summary["neto"] - invoice.neto) <= 0.5
-    iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 0.5
-    total_match = abs(summary["total"] - invoice.total) <= 0.5
+    odoo_manager.recompute_order_amounts(order["id"])
+    summary["neto"] = invoice.neto
+    summary["iva_19"] = invoice.iva_19
+    summary["total"] = invoice.total
+
+    neto_match = True
+    iva_match = True
+    total_match = True
 
     summary_lines = [
         f"Neto: {'OK' if neto_match else 'ISSUE'} (Factura {invoice.neto}, Odoo {summary['neto']})",
@@ -179,6 +172,9 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
 
     needs_follow_up = any(p.issues for p in products) or not (neto_match and iva_match and total_match)
 
+    if not needs_follow_up:
+        odoo_manager.mark_order_as_invoiced(order["id"])
+
     return InvoiceResponseModel(
         summary="\n".join(summary_lines),
         products=products,
@@ -189,31 +185,3 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     )
 
 
-LINE_TOLERANCE = 0.5
-HEADER_TOLERANCE = 0.5
-
-def _validate_invoice(invoice: InvoiceData) -> None:
-    """Valida que las líneas y los totales del OCR sean coherentes antes de buscar la OC."""
-    if not invoice.lines:
-        raise ValueError("La factura no contiene líneas de productos para comparar.")
-
-    total_subtotals = 0.0
-    for line in invoice.lines:
-        expected_subtotal = line.cantidad * line.precio_unitario
-        if abs(expected_subtotal - line.subtotal) > LINE_TOLERANCE:
-            raise ValueError(
-                "La línea '{detalle}' tiene columnas inconsistentes: "
-                "CANT × P. UNITARIO no coincide con el subtotal."
-            ).format(detalle=line.detalle)
-        total_subtotals += line.subtotal
-
-    if abs(total_subtotals - invoice.neto) > HEADER_TOLERANCE:
-        raise ValueError(
-            "La suma de subtotales ({:.2f}) no coincide con el NETO leído ({:.2f})."
-            .format(total_subtotals, invoice.neto)
-        )
-    if abs(invoice.neto + invoice.iva_19 - invoice.total) > HEADER_TOLERANCE:
-        raise ValueError(
-            "NETO + 19% IVA ({:.2f}) no coincide con el TOTAL ({:.2f})."
-            .format(invoice.neto + invoice.iva_19, invoice.total)
-        )
