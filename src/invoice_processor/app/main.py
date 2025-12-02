@@ -7,8 +7,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 import argparse
 from uuid import uuid4
 from langchain_core.messages import SystemMessage, HumanMessage
-from .agent import invoice_agent, invoice_reader_agent
-from .prompts import INVOICE_PROMPT, INVOICE_READER_PROMPT
+from ..agents.agent import invoice_agent, invoice_reader_agent
+from ..prompts.prompts import INVOICE_PROMPT, INVOICE_READER_PROMPT
 from .slack_handler import run_slack_bot
 
 

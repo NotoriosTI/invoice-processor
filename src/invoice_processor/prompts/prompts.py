@@ -42,16 +42,17 @@ INVOICE_OCR_PROMPT = (
     "  ]\n"
     "}\n"
     "Instrucciones estrictas:\n"
-    "1. Identifica la fila de encabezados de la tabla (CÓDIGO | CANT. | DETALLE | P. UNITARIO | TOTAL SIN IVA) y usa solo esas columnas para extraer datos.\n"
+    "1. Identifica la fila de encabezados de la tabla (CÓDIGO | CANT. | DETALLE | P. UNITARIO | TOTAL SIN IVA) y usa solo esas columnas.\n"
     "2. Recorre la tabla FILA POR FILA:\n"
-    "   • CANT. → `cantidad`. Si el texto dice \"25 KG\" o similar, toma únicamente el número (25). No conviertas unidades.\n"
-    "   • DETALLE → `detalle`. Copia el texto completo tal cual aparece (incluye códigos y descripciones, sin traducir ni resumir).\n"
-    "   • P. UNITARIO → `precio_unitario`. Interpreta los valores en pesos chilenos: elimina separadores de miles (\"8.186\" se convierte en 8186.0).\n"
-    "   • TOTAL (sin IVA) → `subtotal`. Usa exclusivamente esa columna para el monto total de la fila.\n"
-    "3. Antes de registrar cada fila, confirma que `cantidad × precio_unitario` sea igual al `subtotal` (tolerancia 0.5) y que `precio_unitario` sea menor que `subtotal`. Si no coincide, vuelve a leer la fila o coloca null en los campos dudosos en lugar de adivinar.\n"
-    "4. Extrae NETO, 19% I.V.A y TOTAL desde el recuadro inferior derecho. Verifica que la suma de los subtotales sea igual al neto y que neto + iva_19 = total. Si no cuadra, relee la factura hasta corregirlo.\n"
-    "5. Si alguna columna no es legible, escribe null para ese campo y anota mentalmente cuál falló. Nunca inventes números ni mezcles columnas.\n"
+    "   • CANT. → `cantidad` (solo el número; si dice «25 KG», toma 25).\n"
+    "   • DETALLE → `detalle`. Copia únicamente el nombre del producto que aparece en la primera línea de la celda; ignora cualquier texto adicional como “Lote…”, “Venc…”, notas u otras observaciones.\n"
+    "   • P. UNITARIO → `precio_unitario` en pesos chilenos (quita separadores de miles: «8.186» ⇒ 8186.0).\n"
+    "   • TOTAL SIN IVA → `subtotal` (monto total de la fila).\n"
+    "3. Antes de registrar cada fila, confirma que `cantidad × precio_unitario ≈ subtotal` (tolerancia 0.5) y que `precio_unitario < subtotal`. Si no coincide, vuelve a leer la fila o deja null en los campos dudosos.\n"
+    "4. Extrae NETO, 19% I.V.A y TOTAL del recuadro inferior derecho y verifica que sum(subtotales) = neto y neto + iva_19 = total.\n"
+    "5. Si una columna no es legible, usa null; nunca inventes valores ni mezcles columnas.\n"
     '6. Si la imagen está dañada o no puedes leerla, responde únicamente {"error": "no_data"}.\n'
 )
+
 
 

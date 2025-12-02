@@ -5,15 +5,15 @@ from typing import Any, Dict, Union
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from pydantic import ValidationError
-from ..config import get_settings
-from ..prompts import INVOICE_OCR_PROMPT
+from ...config import get_settings
+from ...prompts.prompts import INVOICE_OCR_PROMPT
 
 
 class InvoiceOcrClient:
     def __init__(self):
         settings = get_settings()
         self.llm = ChatOpenAI(
-            model=settings.openai_model,
+            model=settings.llm_model,
             openai_api_key=settings.openai_api_key,
             max_tokens=2048,
             model_kwargs={"response_format": {"type": "json_object"}},

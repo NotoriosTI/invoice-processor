@@ -4,9 +4,9 @@ import requests
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from slack_api import SlackBot
-from .config import get_settings
-from .prompts import INVOICE_PROMPT
-from .agent import invoice_agent
+from ..config import get_settings
+from ..prompts.prompts import INVOICE_PROMPT
+from ..agents.agent import invoice_agent
 
 settings = get_settings()
 

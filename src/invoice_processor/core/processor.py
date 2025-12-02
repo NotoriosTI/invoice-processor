@@ -1,9 +1,9 @@
 from typing import Dict, List
 from dev_utils.pretty_logger import PrettyLogger
 
-from .services.odoo_connection_manager import odoo_manager
+from ..infrastructure.services.odoo_connection_manager import odoo_manager
 from .models import InvoiceData, InvoiceLine, ProcessedProduct, InvoiceResponseModel
-from .services.ocr import InvoiceOcrClient
+from ..infrastructure.services.ocr import InvoiceOcrClient
 
 logger = PrettyLogger(service_name="processor")
 ocr_client = InvoiceOcrClient()

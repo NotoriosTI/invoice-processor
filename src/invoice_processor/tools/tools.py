@@ -1,8 +1,8 @@
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from .models import InvoiceData, InvoiceResponseModel
-from .processor import extract_invoice_data, process_invoice_file
+from ..core.models import InvoiceData, InvoiceResponseModel
+from ..core.processor import extract_invoice_data, process_invoice_file
 
 
 class ParseInvoiceArgs(BaseModel):

@@ -2,7 +2,7 @@ import logging
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any, List
 from odoo_api import OdooProduct, OdooWarehouse
-from ..config import get_settings
+from ...config import get_settings
 
 logger = logging.getLogger(__name__)
 MIN_ORDER_SIMILARITY = 0.5
@@ -245,22 +245,38 @@ class OdooConnectionManager:
             move_ids.extend(picking.get("move_ids_without_package", []))
         if not move_ids:
             return []
-        moves = self._execute_kw(
-            "stock.move",
-            "read",
-            [move_ids],
-            {"fields": ["product_id", "quantity_done", "location_dest_id"]},
-        )
+        try:
+            moves = self._execute_kw(
+                "stock.move",
+                "read",
+                [move_ids],
+                {"fields": ["product_id", "product_uom_qty", "quantity_done", "location_dest_id"]},
+            )
+        except Exception as exc:  # algunas versiones no tienen quantity_done
+            if "quantity_done" not in str(exc):
+                raise
+            moves = self._execute_kw(
+                "stock.move",
+                "read",
+                [move_ids],
+                {"fields": ["product_id", "product_uom_qty", "location_dest_id"]},
+            )
         parsed = []
         for move in moves:
+            qty_done = move.get("quantity_done")
+            if qty_done is None:
+                qty_done = move.get("product_uom_qty", 0.0)
             parsed.append(
                 {
                     "product_id": move["product_id"][0] if move.get("product_id") else None,
-                    "quantity_done": move.get("quantity_done", 0.0),
+                    "quantity_done": qty_done,
                     "location": move["location_dest_id"][1] if move.get("location_dest_id") else None,
                 }
             )
         return parsed
+
+
+
 
     def get_product_type(self, product_id: int) -> str:
         """Devuelve el tipo de producto (materia prima vs producto terminado)."""
