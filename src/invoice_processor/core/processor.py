@@ -22,20 +22,61 @@ def extract_invoice_data(image_path: str) -> InvoiceData:
     )
 
 
+def _ask_purchase_action(invoice: InvoiceData) -> str:
+    """Pide al usuario decidir si se crea una OC nueva o si se busca una existente."""
+    supplier = invoice.supplier_name or "Proveedor desconocido"
+    lines_count = len(invoice.lines)
+    summary = (
+        f"Proveedor: {supplier}\n"
+        f"Neto: {invoice.neto} | IVA: {invoice.iva_19} | Total: {invoice.total}\n"
+        f"Líneas detectadas: {lines_count}\n"
+    )
+    prompt = (
+        "¿Cómo deseas proceder? [c] Crear una nueva OC en Odoo | "
+        "[b] Buscar/editar una existente (por defecto). Ingresa opción: "
+    )
+    try:
+        choice = input(f"\nFactura procesada:\n{summary}{prompt}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        choice = ""
+
+    if choice in {"c", "crear", "crear oc", "crear orden", "n"}:
+        return "create"
+    return "search"
+
+
 def _load_purchase_order(invoice: InvoiceData) -> dict:
-    """Busca la orden/cotización más parecida usando proveedor y detalle de productos."""
+    """Busca la orden/cotización más parecida usando proveedor y detalle de productos.
+    Si no existe, crea una nueva orden a partir de la factura."""
     if not invoice.supplier_name:
         raise ValueError("La factura no indica el nombre del proveedor necesario para buscar en Odoo.")
     invoice_details = [line.detalle for line in invoice.lines]
-    order = odoo_manager.find_purchase_order_by_similarity(invoice.supplier_name, invoice_details)
-    if not order:
-        raise ValueError(
-            "No se encontró una orden/cotización en Odoo que coincida con el proveedor y los productos."
-        )
-    if order.get("state") in {"draft", "sent"}:
+
+    created_from_invoice = False
+    action = _ask_purchase_action(invoice)
+
+    if action == "create":
+        logger.info("El usuario solicitó crear una nueva orden directamente desde la factura.")
+        order = odoo_manager.create_purchase_order_from_invoice(invoice)
+        created_from_invoice = True
+    else:
+        order = odoo_manager.find_purchase_order_by_similarity(invoice.supplier_name, invoice_details)
+        if order:
+            logger.info(f"Orden candidata en Odoo: {order.get('name')} (ID {order.get('id')})")
+        if not order:
+            logger.info(
+                "No se encontró una orden existente con productos compatibles; creando una nueva orden en Odoo."
+            )
+            order = odoo_manager.create_purchase_order_from_invoice(invoice)
+            created_from_invoice = True
+
+    if not created_from_invoice and order.get("state") in {"draft", "sent"}:
         logger.info(f"La orden {order['name']} está en estado {order['state']}. Confirmando…")
         order = odoo_manager.confirm_purchase_order(order["id"])
+
+    order["_created_from_invoice"] = created_from_invoice
     return order
+
 
 
 
@@ -173,7 +214,9 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     needs_follow_up = any(p.issues for p in products) or not (neto_match and iva_match and total_match)
 
     if not needs_follow_up:
-        odoo_manager.mark_order_as_invoiced(order["id"])
+        odoo_manager.confirm_order_receipt(order)
+        odoo_manager.create_invoice_for_order(order["id"])
+
 
     return InvoiceResponseModel(
         summary="\n".join(summary_lines),
@@ -183,5 +226,3 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         iva_match=iva_match,
         total_match=total_match,
     )
-
-
