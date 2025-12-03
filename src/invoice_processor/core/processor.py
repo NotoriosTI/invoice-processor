@@ -78,6 +78,12 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
     return order
 
 
+def _finalize_order(order: dict) -> None:
+    """Confirma la recepción y genera la factura en Odoo para la orden proporcionada."""
+    logger.info(f"Finalizando orden {order['name']}: confirmando recepción e invoice en Odoo.")
+    odoo_manager.confirm_order_receipt(order)
+    odoo_manager.create_invoice_for_order(order["id"])
+
 
 
 
@@ -178,6 +184,12 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
 
             if desired_values:
                 odoo_manager.update_order_line(matched_line["id"], desired_values)
+                if "product_qty" in desired_values:
+                    product_result.cantidad_match = True
+                if "price_unit" in desired_values or "price_subtotal" in desired_values:
+                    product_result.precio_match = True
+                    product_result.subtotal_match = True
+                product_result.issues = None
 
             receipt_info = receipt_by_product.get(matched_line.get("product_id"), {})
         else:
@@ -214,8 +226,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     needs_follow_up = any(p.issues for p in products) or not (neto_match and iva_match and total_match)
 
     if not needs_follow_up:
-        odoo_manager.confirm_order_receipt(order)
-        odoo_manager.create_invoice_for_order(order["id"])
+        _finalize_order(order)
 
 
     return InvoiceResponseModel(

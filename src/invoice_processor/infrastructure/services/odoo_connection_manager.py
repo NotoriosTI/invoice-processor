@@ -35,7 +35,10 @@ class OdooConnectionManager:
             "username": settings.odoo_username,
             "password": settings.odoo_password,
         }
+        self._default_uom_id: Optional[int] = None
+        self._default_category_id: Optional[int] = None
         self._initialized = True
+        self._supplierinfo_fields: Optional[Dict[str, dict]] = None
 
     def get_product_client(self) -> OdooProduct:
         if self._product_client is None:
@@ -325,6 +328,51 @@ class OdooConnectionManager:
             [[order_id], {}],
         )
 
+    def _get_default_uom_id(self) -> int:
+        if self._default_uom_id:
+            return self._default_uom_id
+        uom_ids = self._execute_kw("uom.uom", "search", [[]], {"limit": 1})
+        if not uom_ids:
+            raise RuntimeError("No se encontró una unidad de medida en Odoo para crear productos.")
+        self._default_uom_id = uom_ids[0]
+        return self._default_uom_id
+
+    def _get_default_category_id(self) -> int:
+        if self._default_category_id:
+            return self._default_category_id
+        category_ids = self._execute_kw("product.category", "search", [[]], {"limit": 1})
+        if not category_ids:
+            raise RuntimeError("No se encontró una categoría de producto en Odoo para crear productos.")
+        self._default_category_id = category_ids[0]
+        return self._default_category_id
+
+    def _get_supplierinfo_fields(self) -> Dict[str, dict]:
+        if self._supplierinfo_fields is None:
+            fields = self._execute_kw(
+                "product.supplierinfo",
+                "fields_get",
+                [],
+                {"attributes": ["required"]},
+            )
+            self._supplierinfo_fields = fields or {}
+        return self._supplierinfo_fields
+
+    def _supplierinfo_partner_field(self) -> str:
+        fields = self._get_supplierinfo_fields()
+        if "partner_id" in fields:
+            return "partner_id"
+        if "name" in fields:
+            return "name"
+        raise RuntimeError("No hay un campo para asociar el proveedor en product.supplierinfo.")
+
+    def _supplierinfo_product_field(self) -> str:
+        fields = self._get_supplierinfo_fields()
+        if "product_tmpl_id" in fields:
+            return "product_tmpl_id"
+        if "product_id" in fields:
+            return "product_id"
+        raise RuntimeError("No hay un campo para asociar el producto en product.supplierinfo.")
+
     def _find_product_candidate(self, detail: str) -> Optional[int]:
         product_ids = self._execute_kw(
             "product.product",
@@ -366,25 +414,72 @@ class OdooConnectionManager:
         if template_id is None:
             logger.warning("El producto %s no posee plantilla asociada en Odoo.", product_id)
             return
-        if not seller_ids:
-            self._execute_kw(
-                "product.supplierinfo",
-                "create",
-                [[{"name": supplier_id, "product_tmpl_id": template_id, "price": price}]],
-            )
-            return
+        partner_field = self._supplierinfo_partner_field()
+        fields_to_read = ["id", partner_field]
         supplier_infos = self._execute_kw(
             "product.supplierinfo",
             "read",
             [seller_ids],
-            {"fields": ["id", "name"]},
+            {"fields": fields_to_read},
         )
-        if any(info.get("name") and info["name"][0] == supplier_id for info in supplier_infos):
-            return
-        self._execute_kw(
-            "product.supplierinfo",
-            "create",
-            [[{"name": supplier_id, "product_tmpl_id": template_id, "price": price}]],
+        for info in supplier_infos:
+            partner_ref = info.get(partner_field)
+            if partner_ref and partner_ref[0] == supplier_id:
+                return
+        self._create_supplierinfo_record(template_id, product_id, supplier_id, price)
+
+    def _create_supplierinfo_record(
+        self,
+        template_id: Optional[int],
+        product_id: int,
+        supplier_id: int,
+        price: float,
+    ) -> None:
+        fields = self._get_supplierinfo_fields()
+        partner_field = self._supplierinfo_partner_field()
+        product_field = self._supplierinfo_product_field()
+
+        if partner_field == "name":
+            partner_data = self._execute_kw(
+                "res.partner",
+                "read",
+                [[supplier_id]],
+                {"fields": ["name"]},
+            )[0]
+            partner_value: Any = [supplier_id, partner_data.get("name")]
+        else:
+            partner_value = supplier_id
+
+        values: Dict[str, Any] = {"price": price, "min_qty": 1, partner_field: partner_value}
+
+        if product_field == "product_tmpl_id":
+            if not template_id:
+                raise RuntimeError(
+                    "No se pudo determinar product_tmpl_id para crear la relación proveedor-producto."
+                )
+            values["product_tmpl_id"] = template_id
+        else:
+            values["product_id"] = product_id
+
+        if "delay" in fields and "delay" not in values:
+            values["delay"] = 1
+
+        if "company_id" in fields and fields["company_id"].get("required"):
+            partner = self._execute_kw(
+                "res.partner",
+                "read",
+                [[supplier_id]],
+                {"fields": ["company_id"]},
+            )[0]
+            company_ref = partner.get("company_id")
+            if company_ref:
+                values["company_id"] = company_ref[0]
+
+        self._execute_kw("product.supplierinfo", "create", [[values]])
+        logger.info(
+            "Se creó la relación proveedor-producto usando %s y %s",
+            partner_field,
+            product_field,
         )
 
     def ensure_product_for_supplier(self, invoice_line: "InvoiceLine", supplier_id: int) -> int:
@@ -395,6 +490,8 @@ class OdooConnectionManager:
             return product_id
 
         logger.info("Creando producto nuevo para %s", invoice_line.detalle)
+        uom_id = self._get_default_uom_id()
+        category_id = self._get_default_category_id()
         product_id = self._execute_kw(
             "product.product",
             "create",
@@ -403,19 +500,14 @@ class OdooConnectionManager:
                     "name": invoice_line.detalle,
                     "type": "product",
                     "purchase_ok": True,
-                    "seller_ids": [
-                        (
-                            0,
-                            0,
-                            {
-                                "name": supplier_id,
-                                "price": invoice_line.precio_unitario,
-                            },
-                        )
-                    ],
+                    "sale_ok": False,
+                    "uom_id": uom_id,
+                    "uom_po_id": uom_id,
+                    "categ_id": category_id,
                 }
             ]],
         )
+        self._ensure_supplier_on_product(product_id, supplier_id, invoice_line.precio_unitario)
         return product_id
 
 
@@ -547,30 +639,36 @@ class OdooConnectionManager:
             )
 
 
+        order_payload = {
+            "partner_id": partner_id,
+            "date_order": today,
+            "origin": invoice.supplier_name,
+            "order_line": lines,
+        }
+        logger.info(
+            "Intentando crear orden en Odoo para proveedor %s con %s líneas.",
+            partner_id,
+            len(lines),
+        )
         try:
             order_id = self._execute_kw(
                 "purchase.order",
                 "create",
-                [[
-                    {
-                        "partner_id": partner_id,
-                        "date_order": today,
-                        "origin": invoice.supplier_name,
-                        "order_line": lines,
-                    }
-                ]],
+                [[order_payload]],
             )
         except ValueError:
             raise
         except Exception as exc:
-            logger.error("Error al crear la orden de compra en Odoo: %s", exc)
+            logger.error(
+                "Error al crear la orden de compra en Odoo: %s | Payload: %s",
+                exc,
+                order_payload,
+            )
             raise RuntimeError(
                 "Odoo rechazó la creación de la orden. Confirma que el proveedor es correcto o intenta ingresar su ID manual."
             ) from exc
 
         order = self.confirm_purchase_order(order_id)
-        self.confirm_order_receipt(order)
-        self.create_invoice_for_order(order_id)
         return order
 
     
