@@ -21,6 +21,7 @@ class Settings:
         self.llm_model = get_config("LLM_MODEL", "gpt-4o-mini")
         self.slack_app_token = require_config("SLACK_APP_TOKEN")
         self.slack_bot_token = require_config("SLACK_BOT_TOKEN")
+        self.slack_debug_logs = get_config("SLACK_DEBUG_LOGS", False)
 
 
 @lru_cache

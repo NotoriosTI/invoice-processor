@@ -9,8 +9,10 @@ if TYPE_CHECKING:
     from ...core.models import InvoiceLine
 
 logger = logging.getLogger(__name__)
-MIN_ORDER_SIMILARITY = 0.5
-MIN_PRODUCT_LINE_SIMILARITY = 0.6
+MIN_ORDER_SIMILARITY = 0.6
+MIN_PRODUCT_LINE_SIMILARITY = 0.75
+MIN_LINE_MATCH_RATIO = 0.6
+MAX_TOTAL_MISMATCH_RATIO = 0.05
 
 
 class OdooConnectionManager:
@@ -105,18 +107,21 @@ class OdooConnectionManager:
             return 0.0
         return SequenceMatcher(None, left.lower(), right.lower()).ratio()
 
-    def _score_products(self, invoice_details: List[str], order_lines: List[dict]) -> Tuple[float, List[float]]:
+    def _score_products(self, invoice_details: List[str], order_lines: List[dict]) -> Tuple[float, List[float], int]:
         if not invoice_details or not order_lines:
-            return 0.0, []
+            return 0.0, [], 0
         scores: List[float] = []
         total = 0.0
+        matched_lines = 0
         for detail in invoice_details:
             best = 0.0
             for line in order_lines:
                 best = max(best, self._string_similarity(detail, line.get("detalle")))
             scores.append(best)
             total += best
-        return total / max(len(invoice_details), 1), scores
+            if best >= MIN_PRODUCT_LINE_SIMILARITY:
+                matched_lines += 1
+        return total / max(len(invoice_details), 1), scores, matched_lines
 
     def _execute_kw(self, model, method, args=None, kwargs=None):
         """Atajo para llamar XML-RPC usando el product_client actual."""
@@ -135,6 +140,7 @@ class OdooConnectionManager:
         self,
         supplier_name: Optional[str],
         invoice_details: List[str],
+        invoice_total: float,
         limit: int = 20,
     ) -> Optional[dict]:
         """Busca la OC más parecida combinando proveedor (nombre) y líneas."""
@@ -177,25 +183,60 @@ class OdooConnectionManager:
         best_score = 0.0
         best_line_scores: List[float] = []
         best_line_count = 0
+        best_matched_lines = 0
+        best_total = 0.0
+        required_matches = max(1, int(len(invoice_details) * MIN_LINE_MATCH_RATIO))
+        invoice_total_value = float(invoice_total or 0.0)
         for order in orders:
             lines = self.read_order_lines(order.get("order_line", []))
-            product_score, line_scores = self._score_products(invoice_details, lines)
+            product_score, line_scores, matched_lines = self._score_products(invoice_details, lines)
             supplier_score = self._string_similarity(
                 supplier_name,
                 order["partner_id"][1] if order.get("partner_id") else None,
             )
-            score = product_score * 0.7 + supplier_score * 0.3
+            order_total = order.get("amount_total") or 0.0
+            if invoice_total_value <= 0.0:
+                total_ratio = 0.0
+            else:
+                total_ratio = abs(order_total - invoice_total_value) / max(invoice_total_value, 1.0)
+            total_match = 1.0 - min(total_ratio, 1.0)
+
+            if total_ratio > MAX_TOTAL_MISMATCH_RATIO:
+                logger.debug(
+                    "Descartando orden %s por diferencia de total (factura %.2f vs Odoo %.2f).",
+                    order.get("name"),
+                    invoice_total_value,
+                    order_total,
+                )
+                continue
+
+            if matched_lines < required_matches:
+                logger.debug(
+                    "Descartando orden %s: solo %s líneas coinciden (requiere %s).",
+                    order.get("name"),
+                    matched_lines,
+                    required_matches,
+                )
+                continue
+
+            score = product_score * 0.6 + supplier_score * 0.3 + total_match * 0.1
             if score > best_score:
                 best_score = score
                 best_order = order
                 best_line_scores = line_scores
                 best_line_count = len(lines)
+                best_matched_lines = matched_lines
+                best_total = order_total
 
         if best_score < MIN_ORDER_SIMILARITY or not best_order:
             logger.warning(
                 "Similitud insuficiente para vincular la factura (score=%.2f).",
                 best_score,
             )
+            return None
+
+        if not best_order:
+            logger.warning("No se encontró una orden compatible tras aplicar los criterios estrictos.")
             return None
 
         if not best_line_count:
@@ -213,6 +254,15 @@ class OdooConnectionManager:
                 max_line_similarity,
             )
             return None
+
+        logger.info(
+            "La orden %s fue seleccionada (score %.2f, líneas coincidentes %s/%s, total Odoo %.2f).",
+            best_order.get("name"),
+            best_score,
+            best_matched_lines,
+            len(invoice_details) or 1,
+            best_total,
+        )
 
         return best_order
 
@@ -621,49 +671,37 @@ class OdooConnectionManager:
         """
         partner_id = self._find_or_create_supplier(invoice.supplier_name or "Proveedor Desconocido")
         today = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        lines = []
+        line_values: List[dict] = []
         for line in invoice.lines:
             product_id = self.ensure_product_for_supplier(line, partner_id)
-            lines.append(
-                (
-                    0,
-                    0,
-                    {
-                        "name": line.detalle,
-                        "product_id": product_id,
-                        "product_qty": line.cantidad,
-                        "price_unit": line.precio_unitario,
-                        "date_planned": today,
-                    },
-                )
+            line_values.append(
+                {
+                    "name": line.detalle,
+                    "product_id": product_id,
+                    "product_qty": line.cantidad,
+                    "price_unit": line.precio_unitario,
+                    "date_planned": today,
+                }
             )
-
-
         order_payload = {
             "partner_id": partner_id,
             "date_order": today,
             "origin": invoice.supplier_name,
-            "order_line": lines,
         }
         logger.info(
             "Intentando crear orden en Odoo para proveedor %s con %s líneas.",
             partner_id,
-            len(lines),
+            len(line_values),
         )
         try:
-            order_id = self._execute_kw(
-                "purchase.order",
-                "create",
-                [[order_payload]],
-            )
+            order_id = self._execute_kw("purchase.order", "create", [[order_payload]])
+            for line_data in line_values:
+                line_data["order_id"] = f"{{{order_id}}}"
+                self._execute_kw("purchase.order.line", "create", [[line_data]])
         except ValueError:
             raise
         except Exception as exc:
-            logger.error(
-                "Error al crear la orden de compra en Odoo: %s | Payload: %s",
-                exc,
-                order_payload,
-            )
+            logger.error("Error al crear la orden en Odoo: %s | Payload: %s", exc, order_payload)
             raise RuntimeError(
                 "Odoo rechazó la creación de la orden. Confirma que el proveedor es correcto o intenta ingresar su ID manual."
             ) from exc

@@ -1,14 +1,17 @@
 from pathlib import Path
 from queue import Queue
+import logging
 import requests
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from slack_api import SlackBot
+from .slack_bot import SlackBot
 from ..config import get_settings
 from ..prompts.prompts import INVOICE_PROMPT
 from ..agents.agent import invoice_agent
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
+SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 
 
 def download_file(file_info, dest_dir: Path) -> Path:
@@ -16,10 +19,12 @@ def download_file(file_info, dest_dir: Path) -> Path:
     filename = file_info["name"]
     destination = dest_dir / filename
     headers = {"Authorization": f"Bearer {settings.slack_bot_token}"}
+    logger.info("Descargando archivo de Slack: %s -> %s", filename, destination)
     response = requests.get(url, headers=headers, timeout=60)
     response.raise_for_status()
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(response.content)
+    logger.info("Archivo descargado (%d bytes)", len(response.content))
     return destination
 
 
@@ -41,31 +46,80 @@ def run_slack_bot():
         app_token=settings.slack_app_token,
         bot_token=settings.slack_bot_token,
         message_queue=message_queue,
-        debug=False,
+        debug=bool(settings.slack_debug_logs),
     )
+    logger.info("Iniciando Slack bot (debug=%s)", settings.slack_debug_logs)
     slack_bot.start()
 
     while True:
         payload = message_queue.get()
         user_id = payload["user"]
         files = payload.get("files", [])
-        say = payload["say"]
+        channel = payload.get("channel")
+        timestamp = payload.get("timestamp")
+        logger.info(
+            "Evento recibido de Slack user=%s channel=%s ts=%s adjuntos=%d texto=%s",
+            user_id,
+            channel,
+            timestamp,
+            len(files),
+            "sí" if (payload.get("text") or "").strip() else "no",
+        )
 
         if not files:
-            say("Necesito que adjuntes una factura en formato PNG/JPG.")
+            logger.info("Evento sin adjuntos; solicitando nueva factura al usuario %s", user_id)
+            post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
             continue
 
-        file_path = download_file(files[0], Path("/tmp/invoices") / user_id)
+        try:
+            file_path = download_file(files[0], Path("/tmp/invoices") / user_id)
+        except Exception as exc:
+            logger.exception("No se pudo descargar el archivo de Slack")
+            post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
+            continue
         config = {"configurable": {"thread_id": user_id}}
 
         state = invoice_agent.get_state(config)
         is_new_thread = state is None or not state.values.get("messages")
         messages = format_messages(payload.get("text", ""), str(file_path), is_new_thread)
 
-        result = invoice_agent.invoke({"messages": messages}, config=config)
+        try:
+            logger.info("Procesando factura %s con el agente", file_path)
+            result = invoice_agent.invoke({"messages": messages}, config=config)
+        except Exception as exc:
+            logger.exception("El agente falló al procesar la factura")
+            post_message(
+                channel,
+                "Ocurrió un error al procesar la factura. Intenta nuevamente más tarde.",
+                timestamp,
+            )
+            continue
         response = result.summary if hasattr(result, "summary") else str(result)
 
         if getattr(result, "needs_follow_up", False):
             response += "\n⚠️ Se detectaron discrepancias. Revisa los detalles anteriores."
 
-        say(response)
+        try:
+            post_message(channel, response, timestamp)
+        except Exception as exc:
+            logger.error("No se pudo enviar mensaje a Slack: %s", exc)
+            logger.debug("Respuesta que falló: %s", response)
+
+
+def post_message(channel: str | None, text: str, thread_ts: str | None = None) -> None:
+    if not channel:
+        logger.warning("No se puede enviar mensaje a Slack: canal desconocido.")
+        return
+    payload = {"channel": channel, "text": text}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    headers = {
+        "Authorization": f"Bearer {settings.slack_bot_token}",
+        "Content-Type": "application/json;charset=utf-8",
+    }
+    resp = requests.post(SLACK_POST_MESSAGE_URL, headers=headers, json=payload, timeout=15)
+    data = resp.json() if resp.content else {}
+    if not resp.ok or not data.get("ok"):
+        raise RuntimeError(
+            f"Slack API error: {data.get('error') if isinstance(data, dict) else resp.text}"
+        )

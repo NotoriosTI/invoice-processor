@@ -27,6 +27,11 @@ variables:
     source: SLACK_BOT_TOKEN
     type: str
 
+  SLACK_DEBUG_LOGS:
+    source: SLACK_DEBUG_LOGS
+    type: bool
+    default: false
+
 validation:
   required:
     - ODOO_TEST_URL
@@ -38,4 +43,5 @@ validation:
     - SLACK_BOT_TOKEN
   optional:
     - LLM_MODEL
+    - SLACK_DEBUG_LOGS
   strict: false

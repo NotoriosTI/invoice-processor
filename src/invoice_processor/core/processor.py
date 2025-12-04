@@ -22,29 +22,6 @@ def extract_invoice_data(image_path: str) -> InvoiceData:
     )
 
 
-def _ask_purchase_action(invoice: InvoiceData) -> str:
-    """Pide al usuario decidir si se crea una OC nueva o si se busca una existente."""
-    supplier = invoice.supplier_name or "Proveedor desconocido"
-    lines_count = len(invoice.lines)
-    summary = (
-        f"Proveedor: {supplier}\n"
-        f"Neto: {invoice.neto} | IVA: {invoice.iva_19} | Total: {invoice.total}\n"
-        f"Líneas detectadas: {lines_count}\n"
-    )
-    prompt = (
-        "¿Cómo deseas proceder? [c] Crear una nueva OC en Odoo | "
-        "[b] Buscar/editar una existente (por defecto). Ingresa opción: "
-    )
-    try:
-        choice = input(f"\nFactura procesada:\n{summary}{prompt}").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        choice = ""
-
-    if choice in {"c", "crear", "crear oc", "crear orden", "n"}:
-        return "create"
-    return "search"
-
-
 def _load_purchase_order(invoice: InvoiceData) -> dict:
     """Busca la orden/cotización más parecida usando proveedor y detalle de productos.
     Si no existe, crea una nueva orden a partir de la factura."""
@@ -53,22 +30,17 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
     invoice_details = [line.detalle for line in invoice.lines]
 
     created_from_invoice = False
-    action = _ask_purchase_action(invoice)
-
-    if action == "create":
-        logger.info("El usuario solicitó crear una nueva orden directamente desde la factura.")
+    order = odoo_manager.find_purchase_order_by_similarity(
+        invoice.supplier_name,
+        invoice_details,
+        invoice.total,
+    )
+    if order:
+        logger.info(f"Orden candidata en Odoo: {order.get('name')} (ID {order.get('id')})")
+    if not order:
+        logger.info("No se detectó una orden coincidente; creando una nueva en Odoo.")
         order = odoo_manager.create_purchase_order_from_invoice(invoice)
         created_from_invoice = True
-    else:
-        order = odoo_manager.find_purchase_order_by_similarity(invoice.supplier_name, invoice_details)
-        if order:
-            logger.info(f"Orden candidata en Odoo: {order.get('name')} (ID {order.get('id')})")
-        if not order:
-            logger.info(
-                "No se encontró una orden existente con productos compatibles; creando una nueva orden en Odoo."
-            )
-            order = odoo_manager.create_purchase_order_from_invoice(invoice)
-            created_from_invoice = True
 
     if not created_from_invoice and order.get("state") in {"draft", "sent"}:
         logger.info(f"La orden {order['name']} está en estado {order['state']}. Confirmando…")
@@ -226,8 +198,13 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     needs_follow_up = any(p.issues for p in products) or not (neto_match and iva_match and total_match)
 
     if not needs_follow_up:
-        _finalize_order(order)
-
+        try:
+            _finalize_order(order)
+            summary_lines.append("✅ La orden fue recepcionada y facturada automáticamente en Odoo.")
+        except Exception as exc:
+            logger.error(f"No se pudo cerrar automáticamente la orden {order['name']}: {exc}")
+            summary_lines.append("⚠️ No se pudo cerrar automáticamente la orden; revisa Odoo manualmente.")
+            needs_follow_up = True
 
     return InvoiceResponseModel(
         summary="\n".join(summary_lines),
