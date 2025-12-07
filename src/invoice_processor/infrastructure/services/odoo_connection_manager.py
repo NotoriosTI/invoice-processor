@@ -1,12 +1,16 @@
 import logging
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
-from odoo_api import OdooProduct, OdooWarehouse
+from odoo_api import OdooProduct, OdooWarehouse, OdooSupply
 from datetime import datetime
 from ...config import get_settings
 
 if TYPE_CHECKING:
     from ...core.models import InvoiceLine
+
+from rich import print
+from rich.traceback import install
+install()
 
 logger = logging.getLogger(__name__)
 MIN_ORDER_SIMILARITY = 0.6
@@ -21,6 +25,7 @@ class OdooConnectionManager:
     _instance: Optional["OdooConnectionManager"] = None
     _product_client: Optional[OdooProduct] = None
     _warehouse_client: Optional[OdooWarehouse] = None
+    _supply_client: Optional[OdooSupply] = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -53,6 +58,12 @@ class OdooConnectionManager:
             logger.info("Creando conexión OdooWarehouse...")
             self._warehouse_client = OdooWarehouse(**self._connection_config)
         return self._warehouse_client
+
+    def get_supply_client(self) -> OdooSupply:
+        if self._supply_client is None:
+            logger.info("Creando conexión OdooSupply...")
+            self._supply_client = OdooSupply(**self._connection_config)
+        return self._supply_client
 
     def close_product_connection(self):
         if self._product_client:
@@ -278,6 +289,16 @@ class OdooConnectionManager:
             {"fields": ["id", "name", "state", "amount_untaxed", "amount_tax", "amount_total", "order_line", "picking_ids"]},
         )[0]
         return order
+
+    def get_order_status(self, order_id: int) -> dict:
+        """Obtiene estado, recepciones e invoices de una orden."""
+        result = self._execute_kw(
+            "purchase.order",
+            "read",
+            [[order_id]],
+            {"fields": ["state", "picking_ids", "invoice_ids"]},
+        )
+        return result[0] if result else {}
 
     def read_order_lines(self, order_line_ids: list[int]) -> list[dict]:
         """Devuelve las líneas de la orden con SKU, descripción, cantidad y precios."""
@@ -587,55 +608,6 @@ class OdooConnectionManager:
             return best_partner.get("id")
         return None
 
-    def _prompt_supplier_id(self, supplier_name: str) -> Optional[int]:
-        message = (
-            f"No se encontró un proveedor que coincida con '{supplier_name}'.\n"
-            "Ingresa el ID numérico de un proveedor existente en Odoo o deja vacío para crear uno nuevo: "
-        )
-        try:
-            response = input(message)
-        except (EOFError, KeyboardInterrupt):
-            return None
-        response = (response or "").strip()
-        if not response:
-            return None
-        if not response.isdigit():
-            logger.warning("El ID de proveedor proporcionado no es numérico: %s", response)
-            return None
-        supplier_id = int(response)
-        existing = self._execute_kw(
-            "res.partner",
-            "search",
-            [[["id", "=", supplier_id]]],
-            {"limit": 1},
-        )
-        if existing:
-            partner = self._execute_kw(
-                "res.partner",
-                "read",
-                [[supplier_id]],
-                {"fields": ["id", "name"]},
-            )[0]
-            logger.info(
-                "Se utilizará el proveedor proporcionado manualmente: %s (ID %s)",
-                partner.get("name"),
-                supplier_id,
-            )
-            return supplier_id
-        logger.warning("El ID %s no corresponde a un proveedor existente en Odoo.", supplier_id)
-        return None
-
-    def _confirm_supplier_creation(self, supplier_name: str) -> bool:
-        prompt = (
-            f"¿Deseas crear un nuevo proveedor en Odoo con el nombre '{supplier_name}'? [S/n]: "
-        )
-        try:
-            answer = input(prompt)
-        except (EOFError, KeyboardInterrupt):
-            return False
-        normalized = (answer or "").strip().lower()
-        return normalized in {"", "s", "si", "sí"}
-
     def _find_or_create_supplier(self, supplier_name: str) -> int:
         supplier_label = (supplier_name or "Proveedor Desconocido").strip()
         partner_ids = self._execute_kw(
@@ -647,22 +619,21 @@ class OdooConnectionManager:
         selected = self._select_supplier_candidate(supplier_label, partner_ids)
         if selected:
             return selected
-
-        manual_id = self._prompt_supplier_id(supplier_label)
-        if manual_id:
-            return manual_id
-
-        if not self._confirm_supplier_creation(supplier_label):
-            raise ValueError(
-                "Se requiere un proveedor válido en Odoo para continuar. Ingresa el ID existente o acepta crear uno nuevo."
-            )
-
-        logger.info("Creando un nuevo proveedor en Odoo: %s", supplier_label)
-        return self._execute_kw(
-            "res.partner",
-            "create",
-            [[{"name": supplier_label, "company_type": "company"}]],
+        logger.info(
+            "No se encontró proveedor para '%s'. Se creará automáticamente uno nuevo.",
+            supplier_label,
         )
+        try:
+            return self._execute_kw(
+                "res.partner",
+                "create",
+                [[{"name": supplier_label, "company_type": "company", "supplier_rank": 1}]],
+            )
+        except Exception as exc:
+            logger.error("No fue posible crear el proveedor %s: %s", supplier_label, exc)
+            raise RuntimeError(
+                "Odoo rechazó la creación automática del proveedor. Configura el proveedor manualmente en Odoo e intenta nuevamente."
+            ) from exc
 
     def create_purchase_order_from_invoice(self, invoice) -> dict:
         """
@@ -683,30 +654,35 @@ class OdooConnectionManager:
                     "date_planned": today,
                 }
             )
-        order_payload = {
-            "partner_id": partner_id,
-            "date_order": today,
-            "origin": invoice.supplier_name,
-        }
+
+        supply = self.get_supply_client()
         logger.info(
-            "Intentando crear orden en Odoo para proveedor %s con %s líneas.",
+            "Intentando crear orden en Odoo (OdooSupply) para proveedor %s con %s líneas.",
             partner_id,
             len(line_values),
         )
         try:
-            order_id = self._execute_kw("purchase.order", "create", [[order_payload]])
-            for line_data in line_values:
-                line_data["order_id"] = f"{{{order_id}}}"
-                self._execute_kw("purchase.order.line", "create", [[line_data]])
+            result = supply.create_rfq(
+                vendor_id=partner_id,
+                order_lines=line_values,
+                rfq_values={"date_order": today, "origin": invoice.supplier_name},
+                confirm=True,
+            )
+            order_id = result.get("id")
         except ValueError:
             raise
         except Exception as exc:
-            logger.error("Error al crear la orden en Odoo: %s | Payload: %s", exc, order_payload)
+            logger.error("Error al crear la orden en Odoo usando OdooSupply: %s", exc)
             raise RuntimeError(
-                "Odoo rechazó la creación de la orden. Confirma que el proveedor es correcto o intenta ingresar su ID manual."
+                "Odoo rechazó la creación de la orden. Revisa los datos del proveedor/producto e intenta nuevamente."
             ) from exc
 
-        order = self.confirm_purchase_order(order_id)
+        order = self._execute_kw(
+            "purchase.order",
+            "read",
+            [[order_id]],
+            {"fields": ["id", "name", "state", "amount_untaxed", "amount_tax", "amount_total", "order_line", "picking_ids", "partner_id"]},
+        )[0]
         return order
 
     

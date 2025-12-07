@@ -1,15 +1,26 @@
-import logging
-logging.getLogger("langchain").setLevel(logging.ERROR)
-logging.getLogger("langgraph").setLevel(logging.ERROR)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-
 import argparse
 from uuid import uuid4
 from langchain_core.messages import SystemMessage, HumanMessage
 from ..agents.agent import invoice_agent, invoice_reader_agent
 from ..prompts.prompts import INVOICE_PROMPT, INVOICE_READER_PROMPT
 from .slack_handler import run_slack_bot
+import logging
+from rich.logging import RichHandler
+from rich.traceback import install
+from rich.console import Console
+
+install()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[RichHandler(rich_tracebacks=True, markup=True)],
+)
+logging.getLogger("langchain").setLevel(logging.ERROR)
+logging.getLogger("langgraph").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+console = Console()
 
 
 def console_main():
@@ -28,9 +39,9 @@ def console_main():
 
         result = invoice_agent.invoke({"messages": messages}, config=config)
         if hasattr(result, "structured_response"):
-            print(result.structured_response.summary)
+            console.print(result.structured_response.summary)
         else:
-            print(result)
+            console.print(result)
 
 def reader_main(image_path: str):
     """Ejecuta el agente de lectura simple sobre una única imagen."""
@@ -46,9 +57,9 @@ def reader_main(image_path: str):
     ]
     result = invoice_reader_agent.invoke({"messages": messages}, config=config)
     if hasattr(result, "model_dump_json"):
-        print(result.model_dump_json(indent=2))
+        console.print(result.model_dump_json(indent=2))
     else:
-        print(result)
+        console.print(result)
 
 def main():
     parser = argparse.ArgumentParser()

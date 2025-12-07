@@ -1,9 +1,12 @@
 from typing import Dict, List
 from dev_utils.pretty_logger import PrettyLogger
+from rich.traceback import install
 
 from ..infrastructure.services.odoo_connection_manager import odoo_manager
 from .models import InvoiceData, InvoiceLine, ProcessedProduct, InvoiceResponseModel
 from ..infrastructure.services.ocr import InvoiceOcrClient
+
+install()
 
 logger = PrettyLogger(service_name="processor")
 ocr_client = InvoiceOcrClient()
@@ -51,9 +54,22 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
 
 
 def _finalize_order(order: dict) -> None:
-    """Confirma la recepción y genera la factura en Odoo para la orden proporcionada."""
-    logger.info(f"Finalizando orden {order['name']}: confirmando recepción e invoice en Odoo.")
-    odoo_manager.confirm_order_receipt(order)
+    """Confirma la recepción y genera la factura sólo si la orden lo requiere."""
+    status = odoo_manager.get_order_status(order["id"])
+    state = status.get("state")
+    if state not in {"purchase", "done"}:
+        logger.info("Orden %s en estado %s; no se cerrará automáticamente.", order["name"], state)
+        return
+    logger.info(f"Finalizando orden {order['name']} (estado {state}).")
+    picking_ids = status.get("picking_ids") or []
+    if picking_ids:
+        odoo_manager.confirm_order_receipt({"picking_ids": picking_ids})
+    else:
+        logger.info("La orden %s no tiene recepciones pendientes en Odoo.", order["name"])
+    invoice_ids = status.get("invoice_ids") or []
+    if invoice_ids:
+        logger.info("La orden %s ya tiene facturas (%s); se omite la creación automática.", order["name"], invoice_ids)
+        return
     odoo_manager.create_invoice_for_order(order["id"])
 
 
@@ -151,17 +167,26 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                 desired_values["product_qty"] = line.cantidad
             if not product_result.precio_match:
                 desired_values["price_unit"] = line.precio_unitario
-            if not product_result.subtotal_match:
-                desired_values["price_subtotal"] = line.subtotal
 
             if desired_values:
                 odoo_manager.update_order_line(matched_line["id"], desired_values)
-                if "product_qty" in desired_values:
-                    product_result.cantidad_match = True
-                if "price_unit" in desired_values or "price_subtotal" in desired_values:
-                    product_result.precio_match = True
-                    product_result.subtotal_match = True
-                product_result.issues = None
+                refreshed_line = odoo_manager.read_order_lines([matched_line["id"]])[0]
+                product_result.cantidad_match = (
+                    abs(refreshed_line["cantidad"] - line.cantidad) <= 0.01
+                )
+                product_result.precio_match = (
+                    abs(refreshed_line["precio_unitario"] - line.precio_unitario) <= 0.01
+                )
+                product_result.subtotal_match = (
+                    abs(refreshed_line["subtotal"] - line.subtotal) <= 0.5
+                )
+                if product_result.cantidad_match and product_result.precio_match and product_result.subtotal_match:
+                    product_result.issues = None
+                else:
+                    product_result.issues = (
+                        product_result.issues
+                        or "No se pudieron ajustar los valores de la línea en Odoo."
+                    )
 
             receipt_info = receipt_by_product.get(matched_line.get("product_id"), {})
         else:
@@ -176,13 +201,9 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         products.append(product_result)
 
     odoo_manager.recompute_order_amounts(order["id"])
-    summary["neto"] = invoice.neto
-    summary["iva_19"] = invoice.iva_19
-    summary["total"] = invoice.total
-
-    neto_match = True
-    iva_match = True
-    total_match = True
+    neto_match = abs(summary["neto"] - invoice.neto) <= 0.5
+    iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 0.5
+    total_match = abs(summary["total"] - invoice.total) <= 0.5
 
     summary_lines = [
         f"Neto: {'OK' if neto_match else 'ISSUE'} (Factura {invoice.neto}, Odoo {summary['neto']})",

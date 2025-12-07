@@ -14,6 +14,19 @@ logger = logging.getLogger(__name__)
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 
 
+def configure_logging() -> None:
+    level = logging.DEBUG if settings.slack_debug_logs else logging.INFO
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        root_logger.addHandler(handler)
+    root_logger.setLevel(level)
+    logger.setLevel(level)
+    for noisy_logger in ("slack_bolt", "slack_sdk"):
+        logging.getLogger(noisy_logger).setLevel(level)
+
+
 def download_file(file_info, dest_dir: Path) -> Path:
     url = file_info["url_private_download"]
     filename = file_info["name"]
@@ -41,6 +54,7 @@ def format_messages(text: str, file_path: str, is_new: bool):
 
 
 def run_slack_bot():
+    configure_logging()
     message_queue = Queue()
     slack_bot = SlackBot(
         app_token=settings.slack_app_token,
