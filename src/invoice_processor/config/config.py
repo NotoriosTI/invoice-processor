@@ -2,7 +2,7 @@ from functools import lru_cache
 from env_manager import init_config, require_config, get_config
 from pathlib import Path
 
-PROJECT_ROOT = Path().cwd().parent
+PROJECT_ROOT = Path().cwd()
 CONFIG_PATH = PROJECT_ROOT / "config/config_vars.yaml"
 
 init_config(

@@ -1,0 +1,71 @@
+# .github/workflows/deploy.yml
+name: Deploy Invoice Processor
+on:
+  push:
+    branches:
+      - main # El workflow se activa en cada push a la rama main
+
+env:
+  IMAGE_NAME: spacionatural/invoice-processor # Reemplaza con tu usuario de Docker Hub y nombre de imagen
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}, ${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    name: Deploy to Server
+    needs: build-and-push # Este job depende de que el anterior sea exitoso
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Navegar al directorio de la app
+            # Asegúrate de que este directorio existe en tu VM
+            mkdir -p /opt/invoice-processor
+            cd /opt/invoice-processor
+            
+            # Copiar docker-compose.yml si lo tienes en el repo y necesitas que la VM lo tenga actualizado
+            # cp /path/to/repo/docker-compose.yml ./docker-compose.yml 
+            
+            # Descargar la imagen más reciente
+            docker pull ${{ env.IMAGE_NAME }}:latest
+            
+            # Reiniciar el servicio con docker-compose
+            # Asegúrate de que el docker-compose.yml en la VM tenga el nombre de imagen correcto
+            docker-compose up -d
+            
+            # Esperar a que el contenedor inicie y realizar los health checks
+            echo "Waiting 15 seconds for container to start..."
+            sleep 15
+            echo "Running health checks inside the container..."
+            # Asegúrate de que el contenedor 'invoice-processor' esté definido en tu docker-compose.yml
+            # y que poetry esté disponible en la imagen (por eso usamos 'poetry run python')
+            docker-compose exec invoice-processor poetry run python tests/deployment/check_connections.py
+            
+            # Limpiar imágenes de Docker antiguas y sin usar
+            docker image prune -af

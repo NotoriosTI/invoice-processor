@@ -21,10 +21,10 @@ variables:
     default: "gpt-4o-mini"
 
   SLACK_APP_TOKEN:
-    source: SLACK_APP_TOKEN
+    source: INVOICE_SLACK_APP_TOKEN
     type: str
   SLACK_BOT_TOKEN:
-    source: SLACK_BOT_TOKEN
+    source: INVOICE_SLACK_BOT_TOKEN
     type: str
 
   SLACK_DEBUG_LOGS:

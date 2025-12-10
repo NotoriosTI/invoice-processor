@@ -46,6 +46,19 @@ class OdooConnectionManager:
         self._initialized = True
         self._supplierinfo_fields: Optional[Dict[str, dict]] = None
 
+    def check_connection(self) -> bool:
+        """
+        Performs a simple, safe check to confirm the connection to Odoo is live.
+        Returns True if successful, raises an exception otherwise.
+        """
+        logger.info("Verifying Odoo connection by performing a search_count call...")
+        # This call will fail if the connection details are wrong or the server is down.
+        count = self._execute_kw(
+            "res.partner", "search_count", [[["id", "=", -1]]]
+        )
+        logger.info(f"Odoo connection check successful. Found {count} partners (expected 0).")
+        return True
+
     def get_product_client(self) -> OdooProduct:
         if self._product_client is None:
             logger.info("Creando conexión OdooProduct...")
