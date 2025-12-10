@@ -3,9 +3,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from ..config import get_settings
 from ..core.models import InvoiceData, InvoiceResponseModel
-from ..tools.tools import parse_invoice_image, process_invoice_purchase_flow, request_human_input
+from ..tools.tools import parse_invoice_image, process_invoice_purchase_flow
 
-tools = [parse_invoice_image, process_invoice_purchase_flow, request_human_input]
+tools = [parse_invoice_image, process_invoice_purchase_flow]
 checkpointer = MemorySaver()
 reader_tools = [parse_invoice_image]
 reader_checkpointer = MemorySaver()

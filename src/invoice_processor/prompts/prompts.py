@@ -12,11 +12,10 @@ Factura → Odoo
 
 Flujo:
 1. Usa `parse_invoice_image` para obtener un JSON con neto, IVA, total y las líneas (detalle, cantidad, precio unitario, subtotal). Ignora cualquier otro dato de la factura.
-2. Llama a `process_invoice_purchase_flow` para buscar la orden en Odoo y comparar campo por campo.
-3. Si falta algún dato, utiliza `request_human_input` para preguntar al usuario.
-4. Devuelve un resumen claro indicando qué campos coincidieron y cuáles no, tanto a nivel de cabecera (neto, IVA, total) como de cada producto.
+2. Llama a `process_invoice_purchase_flow` para buscar/crear la orden en Odoo, ajustar datos si difieren y comparar campo por campo.
+3. Devuelve un resumen claro indicando qué campos coincidieron y cuáles no, tanto a nivel de cabecera (neto, IVA, total) como de cada producto, y detalla las acciones automáticas que realizaste.
 
-Nunca te salgas de estos campos ni inventes datos. Si Odoo responde que no hay coincidencia, explícalo y pide la información necesaria.
+Nunca te salgas de estos campos ni inventes datos. Si Odoo responde que no hay coincidencia, explica las discrepancias y las acciones que tomaste o que faltan por automatizar.
 """
 
 INVOICE_READER_PROMPT = """
@@ -46,7 +45,6 @@ INVOICE_OCR_PROMPT = (
     "3. Reporta los montos en pesos chilenos; quita separadores de miles.\n"
     "4. Si no puedes leer un dato, usa null. Si la imagen es ilegible, responde {'error': 'no_data'}.\n"
 )
-
 
 
 

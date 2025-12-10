@@ -1,5 +1,6 @@
 from typing import Dict, List
-from dev_utils.pretty_logger import PrettyLogger
+import logging
+from rich.logging import RichHandler
 from rich.traceback import install
 
 from ..infrastructure.services.odoo_connection_manager import odoo_manager
@@ -7,8 +8,14 @@ from .models import InvoiceData, InvoiceLine, ProcessedProduct, InvoiceResponseM
 from ..infrastructure.services.ocr import InvoiceOcrClient
 
 install()
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[RichHandler(rich_tracebacks=True, markup=True)],
+    )
 
-logger = PrettyLogger(service_name="processor")
+logger = logging.getLogger(__name__)
 ocr_client = InvoiceOcrClient()
 
 
@@ -249,8 +256,25 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
             summary_lines.append("✅ La orden fue recepcionada y facturada automáticamente en Odoo.")
         except Exception as exc:
             logger.error(f"No se pudo cerrar automáticamente la orden {order['name']}: {exc}")
-            summary_lines.append("⚠️ No se pudo cerrar automáticamente la orden; revisa Odoo manualmente.")
-            needs_follow_up = True
+            error_summary = "No se pudo crear/editar OC, revisar Odoo manualmente."
+            product_issues = [
+                ProcessedProduct(
+                    detalle=p.detalle if hasattr(p, "detalle") else "desconocido",
+                    cantidad_match=getattr(p, "cantidad_match", False),
+                    precio_match=getattr(p, "precio_match", False),
+                    subtotal_match=getattr(p, "subtotal_match", False),
+                    issues=getattr(p, "issues", None),
+                )
+                for p in products
+            ] or []
+            return InvoiceResponseModel(
+                summary=error_summary,
+                products=product_issues,
+                needs_follow_up=True,
+                neto_match=neto_match,
+                iva_match=iva_match,
+                total_match=total_match,
+            )
 
     return InvoiceResponseModel(
         summary="\n".join(summary_lines),

@@ -33,9 +33,3 @@ def process_invoice_purchase_flow(image_path: str) -> InvoiceResponseModel:
             products=[],
             needs_follow_up=True,
         )
-
-
-@tool("request_human_input")
-def request_human_input(question: str) -> str:
-    """Solicita información adicional al usuario cuando falten datos para continuar."""
-    return f"HUMAN_INPUT_REQUIRED: {question}"

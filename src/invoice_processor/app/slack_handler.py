@@ -14,6 +14,7 @@ from ..agents.agent import invoice_agent
 settings = get_settings()
 logger = logging.getLogger(__name__)
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
+SLACK_REACTION_URL = "https://slack.com/api/reactions.add"
 SLACK_HISTORY_URL = "https://slack.com/api/conversations.history"
 
 
@@ -176,17 +177,41 @@ def run_slack_bot():
                 "Ocurrió un error al procesar la factura. Intenta nuevamente más tarde.",
                 timestamp,
             )
+            try:
+                add_reaction(channel, timestamp, "x")
+            except Exception:
+                logger.debug("No se pudo agregar reacción de error al mensaje original.")
             continue
-        response = result.summary if hasattr(result, "summary") else str(result)
+        # Prefiere la respuesta estructurada del modelo si existe; evita la conversación interna.
+        structured = getattr(result, "structured_response", None)
+        if structured and hasattr(structured, "summary"):
+            response = structured.summary
+            needs_follow_up = getattr(structured, "needs_follow_up", False)
+        elif hasattr(result, "summary"):
+            response = result.summary
+            needs_follow_up = getattr(result, "needs_follow_up", False)
+        else:
+            response = str(result)
+            needs_follow_up = False
 
-        if getattr(result, "needs_follow_up", False):
-            response += "\n⚠️ Se detectaron discrepancias. Revisa los detalles anteriores."
-
-        try:
-            post_message(channel, response, timestamp)
-        except Exception as exc:
-            logger.error("No se pudo enviar mensaje a Slack: %s", exc)
-            logger.debug("Respuesta que falló: %s", response)
+        # Reacciona en el mensaje original: verde si todo OK y se cerró flujo; rojo + mensaje si hay follow-up.
+        if not needs_follow_up:
+            try:
+                add_reaction(channel, timestamp, "white_check_mark")
+            except Exception:
+                logger.debug("No se pudo agregar reacción de éxito al mensaje original.")
+            # No enviamos texto adicional cuando todo está OK.
+            continue
+        else:
+            try:
+                add_reaction(channel, timestamp, "x")
+            except Exception:
+                logger.debug("No se pudo agregar reacción de error al mensaje original.")
+            try:
+                post_message(channel, response, timestamp)
+            except Exception as exc:
+                logger.error("No se pudo enviar mensaje a Slack: %s", exc)
+                logger.debug("Respuesta que falló: %s", response)
 
 
 def post_message(channel: str | None, text: str, thread_ts: str | None = None) -> None:
@@ -205,6 +230,24 @@ def post_message(channel: str | None, text: str, thread_ts: str | None = None) -
     if not resp.ok or not data.get("ok"):
         raise RuntimeError(
             f"Slack API error: {data.get('error') if isinstance(data, dict) else resp.text}"
+        )
+
+
+def add_reaction(channel: str | None, timestamp: str | None, emoji: str) -> None:
+    """Agrega una reacción al mensaje original del usuario."""
+    if not channel or not timestamp:
+        logger.debug("No se puede agregar reacción: faltan channel o timestamp.")
+        return
+    payload = {"channel": channel, "timestamp": timestamp, "name": emoji}
+    headers = {
+        "Authorization": f"Bearer {settings.slack_bot_token}",
+        "Content-Type": "application/json;charset=utf-8",
+    }
+    resp = requests.post(SLACK_REACTION_URL, headers=headers, json=payload, timeout=10)
+    data = resp.json() if resp.content else {}
+    if not resp.ok or not data.get("ok"):
+        raise RuntimeError(
+            f"Slack reaction error: {data.get('error') if isinstance(data, dict) else resp.text}"
         )
 def _fetch_files_from_slack(channel: str | None, ts: str | None):
     """Obtiene los archivos del mensaje original usando la Web API si no vienen en el evento."""
