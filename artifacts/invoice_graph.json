@@ -1,0 +1,83 @@
+{
+  "nodes": [
+    {
+      "id": "__start__",
+      "type": "runnable",
+      "data": {
+        "id": [
+          "langgraph",
+          "_internal",
+          "_runnable",
+          "RunnableCallable"
+        ],
+        "name": "__start__"
+      }
+    },
+    {
+      "id": "agent",
+      "type": "runnable",
+      "data": {
+        "id": [
+          "langgraph",
+          "_internal",
+          "_runnable",
+          "RunnableCallable"
+        ],
+        "name": "agent"
+      }
+    },
+    {
+      "id": "tools",
+      "type": "runnable",
+      "data": {
+        "id": [
+          "langgraph",
+          "prebuilt",
+          "tool_node",
+          "ToolNode"
+        ],
+        "name": "tools"
+      }
+    },
+    {
+      "id": "generate_structured_response",
+      "type": "runnable",
+      "data": {
+        "id": [
+          "langgraph",
+          "_internal",
+          "_runnable",
+          "RunnableCallable"
+        ],
+        "name": "generate_structured_response"
+      }
+    },
+    {
+      "id": "__end__"
+    }
+  ],
+  "edges": [
+    {
+      "source": "__start__",
+      "target": "agent"
+    },
+    {
+      "source": "agent",
+      "target": "generate_structured_response",
+      "conditional": true
+    },
+    {
+      "source": "agent",
+      "target": "tools",
+      "conditional": true
+    },
+    {
+      "source": "tools",
+      "target": "agent"
+    },
+    {
+      "source": "generate_structured_response",
+      "target": "__end__"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+services:
+  invoice-processor:
+    # Esta es la imagen que el script de deploy descargará de Docker Hub
+    image: us-central1-docker.pkg.dev/notorios/invoice-processor-repo/invoice-processor:latest
+    container_name: invoice-processor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # La aplicación buscará secretos en GCP
+      - SECRET_ORIGIN=gcp 
+      # El project ID sigue siendo necesario
+      - GCP_PROJECT_ID=notorios
+    # No hay sección 'volumes' ni 'GOOGLE_APPLICATION_CREDENTIALS',
+    # permitiendo que la autenticación ocurra automáticamente a través 
+    # del Service Account de la VM.
