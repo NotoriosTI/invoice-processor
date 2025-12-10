@@ -4,17 +4,16 @@ from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 from odoo_api import OdooProduct, OdooWarehouse, OdooSupply
 from datetime import datetime
 from ...config import get_settings
+from rich.traceback import install
+
+install()
 
 if TYPE_CHECKING:
     from ...core.models import InvoiceLine
 
-from rich import print
-from rich.traceback import install
-install()
-
 logger = logging.getLogger(__name__)
-MIN_ORDER_SIMILARITY = 0.6
-MIN_PRODUCT_LINE_SIMILARITY = 0.75
+MIN_ORDER_SIMILARITY = 0.5
+MIN_PRODUCT_LINE_SIMILARITY = 0.6
 MIN_LINE_MATCH_RATIO = 0.6
 MAX_TOTAL_MISMATCH_RATIO = 0.05
 
@@ -332,6 +331,16 @@ class OdooConnectionManager:
             )
         return parsed
 
+    def read_order(self, order_id: int) -> dict:
+        """Lee la orden de compra con sus totales y referencias clave."""
+        result = self._execute_kw(
+            "purchase.order",
+            "read",
+            [[order_id]],
+            {"fields": ["id", "name", "state", "amount_untaxed", "amount_tax", "amount_total", "order_line", "picking_ids", "partner_id"]},
+        )
+        return result[0] if result else {}
+
     def read_receipts_for_order(self, picking_ids: list[int]) -> list[dict]:
         """Lee los pickings asociados y devuelve cantidades recepcionadas y ubicación."""
         if not picking_ids:
@@ -618,6 +627,31 @@ class OdooConnectionManager:
         )
         selected = self._select_supplier_candidate(supplier_label, partner_ids)
         if selected:
+            # Si existe pero no está marcado como proveedor, se actualiza supplier_rank=1.
+            try:
+                partner = self._execute_kw(
+                    "res.partner",
+                    "read",
+                    [[selected]],
+                    {"fields": ["supplier_rank", "name"]},
+                )[0]
+                if (partner.get("supplier_rank") or 0) < 1:
+                    logger.info(
+                        "Actualizando supplier_rank=1 para el proveedor existente '%s' (ID %s).",
+                        partner.get("name"),
+                        selected,
+                    )
+                    self._execute_kw(
+                        "res.partner",
+                        "write",
+                        [[selected], {"supplier_rank": 1}],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo verificar/actualizar supplier_rank del proveedor %s: %s",
+                    selected,
+                    exc,
+                )
             return selected
         logger.info(
             "No se encontró proveedor para '%s'. Se creará automáticamente uno nuevo.",

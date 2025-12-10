@@ -3,6 +3,8 @@ from queue import Queue
 import logging
 import requests
 from langchain_core.messages import SystemMessage, HumanMessage
+from rich.logging import RichHandler
+from rich.traceback import install
 
 from .slack_bot import SlackBot
 from ..config import get_settings
@@ -12,17 +14,18 @@ from ..agents.agent import invoice_agent
 settings = get_settings()
 logger = logging.getLogger(__name__)
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
+SLACK_HISTORY_URL = "https://slack.com/api/conversations.history"
 
 
 def configure_logging() -> None:
     level = logging.DEBUG if settings.slack_debug_logs else logging.INFO
-    root_logger = logging.getLogger()
-    if not root_logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-        root_logger.addHandler(handler)
-    root_logger.setLevel(level)
-    logger.setLevel(level)
+    install()
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        handlers=[RichHandler(rich_tracebacks=True, markup=True)],
+        force=True,
+    )
     for noisy_logger in ("slack_bolt", "slack_sdk"):
         logging.getLogger(noisy_logger).setLevel(level)
 
@@ -67,26 +70,89 @@ def run_slack_bot():
 
     while True:
         payload = message_queue.get()
-        user_id = payload["user"]
-        files = payload.get("files", [])
-        channel = payload.get("channel")
-        timestamp = payload.get("timestamp")
+        event = payload.get("event") or payload  # algunos adaptadores entregan el evento anidado
+        inner_message = event.get("message") or {}
+        previous_message = inner_message.get("previous_message", {}) or event.get("previous_message", {}) or {}
+
+        # Datos base del evento
+        user_id = event.get("user") or event.get("user_id") or inner_message.get("user") or previous_message.get("user")
+        bot_id = event.get("bot_id") or inner_message.get("bot_id")
+        subtype = event.get("subtype")
+        hidden = event.get("hidden")
+        inner_subtype = inner_message.get("subtype")
+        inner_hidden = inner_message.get("hidden")
+        files = event.get("files", [])
+        # Algunos eventos (message_changed, file_share) traen los archivos anidados en message o previous_message.
+        if not files and inner_message.get("files"):
+            files = inner_message.get("files")
+        if not files and inner_message.get("previous_message", {}).get("files"):
+            files = inner_message.get("previous_message", {}).get("files")
+        channel = event.get("channel") or inner_message.get("channel")
+        timestamp = event.get("timestamp") or event.get("ts") or inner_message.get("ts") or previous_message.get("ts")
+        incoming_text = (event.get("text") or inner_message.get("text") or previous_message.get("text") or "").strip()
         logger.info(
             "Evento recibido de Slack user=%s channel=%s ts=%s adjuntos=%d texto=%s",
             user_id,
             channel,
             timestamp,
             len(files),
-            "sí" if (payload.get("text") or "").strip() else "no",
+            "sí" if incoming_text else "no",
         )
 
+        # Ignora mensajes generados por el propio bot para evitar loops.
+        if bot_id or (subtype and subtype == "bot_message") or (user_id and user_id.startswith("B")):
+            logger.debug("Evento ignorado por ser del bot (bot_id=%s, subtype=%s, user=%s).", bot_id, subtype, user_id)
+            continue
+
+        # Solo procesamos mensajes de usuario con subtipos permitidos.
+        allowed_subtypes = {None, "", "file_share"}
+        sys_subtypes = {"message_changed", "message_deleted", "tombstone"}
+        current_subtype = inner_subtype or subtype
+        previous_subtype = previous_message.get("subtype")
+        if (
+            hidden
+            or inner_hidden
+            or current_subtype in sys_subtypes
+            or previous_subtype in sys_subtypes
+            or user_id == "USLACKBOT"
+            or current_subtype not in allowed_subtypes
+        ):
+            logger.debug(
+                "Evento ignorado por subtipo no permitido (hidden=%s/%s, subtype=%s, inner_subtype=%s, prev_subtype=%s, user=%s, files=%d).",
+                hidden,
+                inner_hidden,
+                subtype,
+                inner_subtype,
+                previous_subtype,
+                user_id,
+                len(files),
+            )
+            continue
+
         if not files:
+            # Intentar recuperar archivos del mensaje original (mensajes de Slack que llegan sin files en el evento).
+            fetched_files = _fetch_files_from_slack(channel, timestamp)
+            if fetched_files:
+                files = fetched_files
+
+        if not files:
+            if not incoming_text:
+                logger.debug("Evento sin adjuntos ni texto; se ignora.")
+                continue
             logger.info("Evento sin adjuntos; solicitando nueva factura al usuario %s", user_id)
             post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
             continue
 
+        # Valida que el archivo principal sea imagen; si no, solicita PNG/JPG.
+        file_info = files[0]
+        mimetype = (file_info.get("mimetype") or file_info.get("filetype") or "").lower()
+        if "image" not in mimetype:
+            logger.info("Adjunto ignorado por no ser imagen (mimetype=%s).", mimetype)
+            post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
+            continue
+
         try:
-            file_path = download_file(files[0], Path("/tmp/invoices") / user_id)
+            file_path = download_file(file_info, Path("/tmp/invoices") / user_id)
         except Exception as exc:
             logger.exception("No se pudo descargar el archivo de Slack")
             post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
@@ -95,7 +161,10 @@ def run_slack_bot():
 
         state = invoice_agent.get_state(config)
         is_new_thread = state is None or not state.values.get("messages")
-        messages = format_messages(payload.get("text", ""), str(file_path), is_new_thread)
+        # Si no hay texto, usar un mensaje por defecto
+        if not incoming_text:
+            incoming_text = "Procesa esta factura."
+        messages = format_messages(incoming_text, str(file_path), is_new_thread)
 
         try:
             logger.info("Procesando factura %s con el agente", file_path)
@@ -137,3 +206,25 @@ def post_message(channel: str | None, text: str, thread_ts: str | None = None) -
         raise RuntimeError(
             f"Slack API error: {data.get('error') if isinstance(data, dict) else resp.text}"
         )
+def _fetch_files_from_slack(channel: str | None, ts: str | None):
+    """Obtiene los archivos del mensaje original usando la Web API si no vienen en el evento."""
+    if not channel or not ts:
+        return []
+    try:
+        params = {
+            "channel": channel,
+            "latest": ts,
+            "inclusive": "true",
+            "limit": 1,
+        }
+        headers = {"Authorization": f"Bearer {settings.slack_bot_token}"}
+        resp = requests.get(SLACK_HISTORY_URL, headers=headers, params=params, timeout=10)
+        data = resp.json() if resp.content else {}
+        messages = data.get("messages") or []
+        if not messages:
+            return []
+        files = messages[0].get("files") or []
+        return files
+    except Exception as exc:
+        logger.warning("No se pudieron recuperar archivos desde Slack: %s", exc)
+        return []

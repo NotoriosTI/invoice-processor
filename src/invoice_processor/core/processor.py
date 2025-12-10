@@ -77,12 +77,19 @@ def _finalize_order(order: dict) -> None:
 
 def _build_order_summary(order: dict) -> Dict[str, any]:
     """Obtiene desde Odoo los totales y las líneas de la orden (detalle, cantidad, precios)."""
-    lines = odoo_manager.read_order_lines(order.get("order_line", []))
-    receipts = odoo_manager.read_receipts_for_order(order.get("picking_ids", []))
+    order_data = order
+    if order.get("id"):
+        # Relee la orden para asegurarse de tener montos y referencias actualizadas.
+        fresh = odoo_manager.read_order(order["id"])
+        if fresh:
+            order_data = fresh
+
+    lines = odoo_manager.read_order_lines(order_data.get("order_line", []))
+    receipts = odoo_manager.read_receipts_for_order(order_data.get("picking_ids", []))
     return {
-        "neto": order.get("amount_untaxed", 0.0),
-        "iva_19": order.get("amount_tax", 0.0),
-        "total": order.get("amount_total", 0.0),
+        "neto": order_data.get("amount_untaxed", 0.0),
+        "iva_19": order_data.get("amount_tax", 0.0),
+        "total": order_data.get("amount_total", 0.0),
         "lines": lines,
         "receipts": receipts,
     }
@@ -141,6 +148,18 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     compara cabecera y líneas, verifica recepción y construye el resumen final.
     """
     invoice = extract_invoice_data(image_path)
+    # Normaliza líneas si subtotal y precio unitario no son consistentes.
+    normalized_lines: List[InvoiceLine] = []
+    for line in invoice.lines:
+        expected_subtotal = line.precio_unitario * line.cantidad
+        if abs(expected_subtotal - line.subtotal) > 0.01 and line.cantidad != 0:
+            corrected_price = line.subtotal / line.cantidad
+            normalized_lines.append(
+                line.model_copy(update={"precio_unitario": corrected_price})
+            )
+        else:
+            normalized_lines.append(line)
+    invoice = invoice.model_copy(update={"lines": normalized_lines})
 
     if not invoice.lines:
         raise ValueError("La factura no contiene líneas de productos para comparar.")
@@ -167,6 +186,10 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                 desired_values["product_qty"] = line.cantidad
             if not product_result.precio_match:
                 desired_values["price_unit"] = line.precio_unitario
+            # Si solo falla el subtotal, ajusta el precio unitario para que coincida con la factura.
+            if not product_result.subtotal_match and "price_unit" not in desired_values:
+                if line.cantidad != 0:
+                    desired_values["price_unit"] = line.subtotal / line.cantidad
 
             if desired_values:
                 odoo_manager.update_order_line(matched_line["id"], desired_values)
@@ -201,6 +224,8 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         products.append(product_result)
 
     odoo_manager.recompute_order_amounts(order["id"])
+    # Releer la orden tras las actualizaciones para usar totales y líneas frescos.
+    summary = _build_order_summary(order)
     neto_match = abs(summary["neto"] - invoice.neto) <= 0.5
     iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 0.5
     total_match = abs(summary["total"] - invoice.total) <= 0.5
