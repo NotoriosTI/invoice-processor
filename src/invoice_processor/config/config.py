@@ -1,14 +1,21 @@
 from functools import lru_cache
 from env_manager import init_config, require_config, get_config
+from pathlib import Path
+
+PROJECT_ROOT = Path().cwd().parent
+CONFIG_PATH = PROJECT_ROOT / "config/config_vars.yaml"
 
 init_config(
-    "config/config_vars.yaml",
+    CONFIG_PATH,
     secret_origin=None,
     gcp_project_id=None,
     strict=None,
     dotenv_path=None,
     debug=False,
 )
+
+DATA_PATH = Path(get_config("DATA_PATH"))
+DEFAULT_INVOICE_PATH = DATA_PATH / "factura.jpg"
 
 
 class Settings:
@@ -22,8 +29,9 @@ class Settings:
         self.slack_app_token = require_config("SLACK_APP_TOKEN")
         self.slack_bot_token = require_config("SLACK_BOT_TOKEN")
         self.slack_debug_logs = get_config("SLACK_DEBUG_LOGS", False)
+        self.data_path = DATA_PATH
+        self.default_invoice_path = DEFAULT_INVOICE_PATH
 
 
-@lru_cache
 def get_settings() -> Settings:
     return Settings()

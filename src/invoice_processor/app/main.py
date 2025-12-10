@@ -1,5 +1,6 @@
 import argparse
 from uuid import uuid4
+from env_manager import get_config
 from langchain_core.messages import SystemMessage, HumanMessage
 from ..agents.agent import invoice_agent, invoice_reader_agent
 from ..prompts.prompts import INVOICE_PROMPT, INVOICE_READER_PROMPT
@@ -8,6 +9,8 @@ import logging
 from rich.logging import RichHandler
 from rich.traceback import install
 from rich.console import Console
+from pathlib import Path
+from ..config import get_settings
 
 install()
 
@@ -34,7 +37,8 @@ def console_main():
 
         messages = (
             [SystemMessage(content=INVOICE_PROMPT), HumanMessage(content=text)]
-            if is_new else [HumanMessage(content=text)]
+            if is_new
+            else [HumanMessage(content=text)]
         )
 
         result = invoice_agent.invoke({"messages": messages}, config=config)
@@ -42,6 +46,7 @@ def console_main():
             console.print(result.structured_response.summary)
         else:
             console.print(result)
+
 
 def reader_main(image_path: str):
     """Ejecuta el agente de lectura simple sobre una única imagen."""
@@ -61,18 +66,21 @@ def reader_main(image_path: str):
     else:
         console.print(result)
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["console", "slack", "reader"], default="console")
+    parser.add_argument(
+        "--mode", choices=["console", "slack", "reader"], default="console"
+    )
     parser.add_argument("--image", help="Ruta de la factura a leer (solo modo reader)")
     args = parser.parse_args()
 
     if args.mode == "slack":
         run_slack_bot()
     elif args.mode == "reader":
-        if not args.image:
-            parser.error("--image es obligatorio cuando se usa --mode reader")
-        reader_main(args.image)
+        settings = get_settings()
+        path = args.image or settings.default_invoice_path
+        reader_main(path)
     else:
         console_main()
 

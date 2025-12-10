@@ -32,6 +32,11 @@ variables:
     type: bool
     default: false
 
+  DATA_PATH:
+    source: DATA_PATH
+    type: str
+    default: /Users/bastianibanez/work/invoice-processor/data
+
 validation:
   required:
     - ODOO_TEST_URL
@@ -41,6 +46,7 @@ validation:
     - OPENAI_API_KEY
     - SLACK_APP_TOKEN
     - SLACK_BOT_TOKEN
+    - DATA_PATH
   optional:
     - LLM_MODEL
     - SLACK_DEBUG_LOGS
