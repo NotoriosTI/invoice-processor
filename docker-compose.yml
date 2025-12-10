@@ -1,7 +1,7 @@
 services:
   invoice-processor:
     # Esta es la imagen que el script de deploy descargará de Docker Hub
-    image: ${{ secrets.DOCKERHUB_USERNAME }}/invoice-processor:latest
+    image: us-central1-docker.pkg.dev/notorios/invoice-processor-repo/invoice-processor:latest
     container_name: invoice-processor
     restart: unless-stopped
     ports:
