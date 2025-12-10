@@ -1,71 +1,72 @@
-# .github/workflows/deploy.yml
-name: Deploy Invoice Processor
+name: Deploy to GCP
+
 on:
   push:
     branches:
-      - main # El workflow se activa en cada push a la rama main
+      - main
 
 env:
-  IMAGE_NAME: spacionatural/invoice-processor # Reemplaza con tu usuario de Docker Hub y nombre de imagen
+  GAR_REGISTRY: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }} # Define el registry de GAR
+  GAR_REPOSITORY: invoice-processor-repo # Define el nombre del repositorio en GAR
 
 jobs:
-  build-and-push:
-    name: Build and Push Docker Image
+  build-and-push-to-gar:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      # Autenticarse en Google Cloud (para push a GAR)
+      - name: Google Auth
+        uses: google-github-actions/auth@v2
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Build and push Docker image
+      # Configurar Docker para usar el Docker CLI credential helper para GCR/GAR
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      # Construir y subir la imagen a Google Artifact Registry
+      - name: Build and push to GAR
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}, ${{ env.IMAGE_NAME }}:latest
+          tags: ${{ env.GAR_REGISTRY }}/${{ env.GAR_REPOSITORY }}/invoice-processor:latest
 
   deploy:
-    name: Deploy to Server
-    needs: build-and-push # Este job depende de que el anterior sea exitoso
-    runs-on: ubuntu-latest
-
+    needs: build-and-push-to-gar
+    runs-on: self-hosted # Esto debe ejecutarse en tu VM de GCP
     steps:
-      - name: Deploy to server via SSH
+      # No es necesario Checkout aquí si solo usamos SSH para ejecutar comandos.
+
+      - name: Deploy and Run Health Checks
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            # Navegar al directorio de la app
-            # Asegúrate de que este directorio existe en tu VM
-            mkdir -p /opt/invoice-processor
-            cd /opt/invoice-processor
-            
-            # Copiar docker-compose.yml si lo tienes en el repo y necesitas que la VM lo tenga actualizado
-            # cp /path/to/repo/docker-compose.yml ./docker-compose.yml 
-            
-            # Descargar la imagen más reciente
-            docker pull ${{ env.IMAGE_NAME }}:latest
-            
-            # Reiniciar el servicio con docker-compose
-            # Asegúrate de que el docker-compose.yml en la VM tenga el nombre de imagen correcto
+            # Configurar Docker para usar el Docker CLI credential helper para GCR/GAR en la VM
+            # Esto usa las credenciales del Service Account de la VM
+            gcloud auth configure-docker ${{ env.GAR_REGISTRY }} --project ${{ secrets.GCP_PROJECT_ID }}
+
+            # Navegar a la carpeta de despliegue en la VM
+            cd /opt/invoice
+
+            # Descargar la imagen más reciente desde Google Artifact Registry
+            docker pull ${{ env.GAR_REGISTRY }}/${{ env.GAR_REPOSITORY }}/invoice-processor:latest
+
+            # Detener y reiniciar el servicio con la nueva imagen
+            docker-compose down
             docker-compose up -d
-            
-            # Esperar a que el contenedor inicie y realizar los health checks
-            echo "Waiting 15 seconds for container to start..."
+
+            echo "✅ Despliegue completado. Esperando 15s para que inicie el servicio..."
             sleep 15
-            echo "Running health checks inside the container..."
-            # Asegúrate de que el contenedor 'invoice-processor' esté definido en tu docker-compose.yml
-            # y que poetry esté disponible en la imagen (por eso usamos 'poetry run python')
-            docker-compose exec invoice-processor poetry run python tests/deployment/check_connections.py
-            
-            # Limpiar imágenes de Docker antiguas y sin usar
-            docker image prune -af
+
+            # Ejecutar Health Checks en la VM...
+            echo "🔍 Ejecutando Health Checks en la VM..."
+            docker-compose exec invoice-processor python -m tests.deployment.check_gcp_secrets
+            docker-compose exec invoice-processor python -m tests.deployment.check_llm
+            docker-compose exec invoice-processor python -m tests.deployment.check_odoo
+            echo "🎉 Todos los health checks pasaron."
