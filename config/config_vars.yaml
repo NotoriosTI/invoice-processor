@@ -15,8 +15,8 @@ variables:
   OPENAI_API_KEY:
     source: OPENAI_API_KEY
     type: str
-  OPENAI_MODEL:
-    source: OPENAI_MODEL
+  LLM_MODEL:
+    source: LLM_MODEL
     type: str
     default: "gpt-4o-mini"
 
@@ -26,6 +26,11 @@ variables:
   SLACK_BOT_TOKEN:
     source: SLACK_BOT_TOKEN
     type: str
+
+  SLACK_DEBUG_LOGS:
+    source: SLACK_DEBUG_LOGS
+    type: bool
+    default: false
 
 validation:
   required:
@@ -37,5 +42,6 @@ validation:
     - SLACK_APP_TOKEN
     - SLACK_BOT_TOKEN
   optional:
-    - OPENAI_MODEL
+    - LLM_MODEL
+    - SLACK_DEBUG_LOGS
   strict: false
