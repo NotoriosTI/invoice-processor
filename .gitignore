@@ -209,3 +209,6 @@ __marimo__/
 # Test data
 data/
 todos.txt
+
+# Github-pusher
+github-pusher-key.json
