@@ -13,6 +13,9 @@ class InvoiceData(BaseModel):
     supplier_name: Optional[str] = Field(
         default=None, description="Nombre del proveedor según la factura"
     )
+    descuento_global: float = Field(
+        default=0.0, description="Descuento global aplicado al documento (CLP)"
+    )
     neto: float = Field(..., description="Monto NETO del documento")
     iva_19: float = Field(..., description="Impuesto 19% I.V.A")
     total: float = Field(..., description="TOTAL general de la factura")

@@ -9,6 +9,7 @@ Factura → Odoo
 - NETO ↔ Monto neto
 - 19% I.V.A ↔ IVA 19%
 - TOTAL ↔ Total del documento
+- DESCUENTO_GLOBAL ↔ Descuento aplicado al total (si no existe, usar 0)
 
 Flujo:
 1. Usa `parse_invoice_image` para obtener un JSON con neto, IVA, total y las líneas (detalle, cantidad, precio unitario, subtotal). Ignora cualquier otro dato de la factura.
@@ -36,6 +37,7 @@ INVOICE_OCR_PROMPT = (
     '  "neto": number,\n'
     '  "iva_19": number,\n'
     '  "total": number,\n'
+    '  "descuento_global": number,\n'
     '  "lines": [\n'
     '     {"detalle": string, "cantidad": number, "precio_unitario": number, "subtotal": number}\n'
     "  ]\n"
@@ -43,8 +45,8 @@ INVOICE_OCR_PROMPT = (
     "1. Toma cada fila de la tabla (CANT | DETALLE | P. UNITARIO | TOTAL sin IVA) y copia los valores literal.\n"
     "2. Ignora textos adicionales en la misma celda (lote, vencimiento, notas). Solo guarda el nombre del producto.\n"
     "3. Reporta los montos en pesos chilenos; quita separadores de miles.\n"
-    "4. Si no puedes leer un dato, usa null. Si la imagen es ilegible, responde {'error': 'no_data'}.\n"
+    "4. Si existe 'Descuento global', repórtalo en 'descuento_global'; si no aparece, usa 0.\n"
+    "5. Si no puedes leer un dato, usa null. Si la imagen es ilegible, responde {'error': 'no_data'}.\n"
 )
-
 
 

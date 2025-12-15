@@ -41,23 +41,52 @@ class OdooConnectionManager:
             "username": settings.odoo_username,
             "password": settings.odoo_password,
         }
+        raw_tax_ids = settings.default_purchase_tax_ids
+        if isinstance(raw_tax_ids, str):
+            raw_list = [x.strip() for x in raw_tax_ids.split(",") if x.strip()]
+        else:
+            raw_list = raw_tax_ids or []
+        self._default_purchase_tax_ids = self._normalize_id_list(raw_list)
         self._default_uom_id: Optional[int] = None
         self._default_category_id: Optional[int] = None
         self._initialized = True
         self._supplierinfo_fields: Optional[Dict[str, dict]] = None
 
-    def check_connection(self) -> bool:
+    @staticmethod
+    def _normalize_id(value: Any) -> Optional[int]:
         """
-        Performs a simple, safe check to confirm the connection to Odoo is live.
-        Returns True if successful, raises an exception otherwise.
+        Convierte valores devueltos por Odoo a int seguro:
+        - Si es lista/tupla anidada, toma el primer elemento numérico.
+        - Si es (id, name), usa id.
+        - Si es str numérica o float, castea a int.
+        - Si no hay valor numérico, devuelve None.
         """
-        logger.info("Verifying Odoo connection by performing a search_count call...")
-        # This call will fail if the connection details are wrong or the server is down.
-        count = self._execute_kw(
-            "res.partner", "search_count", [[["id", "=", -1]]]
-        )
-        logger.info(f"Odoo connection check successful. Found {count} partners (expected 0).")
-        return True
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                norm = OdooConnectionManager._normalize_id(item)
+                if norm is not None:
+                    return norm
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(float(value))
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _normalize_id_list(values: List[Any]) -> List[int]:
+        """Aplana y convierte cualquier lista de IDs a enteros."""
+        flat: List[int] = []
+        for val in values or []:
+            norm = OdooConnectionManager._normalize_id(val)
+            if norm is not None:
+                flat.append(norm)
+        return flat
 
     def get_product_client(self) -> OdooProduct:
         if self._product_client is None:
@@ -147,15 +176,20 @@ class OdooConnectionManager:
         return total / max(len(invoice_details), 1), scores, matched_lines
 
     def _execute_kw(self, model, method, args=None, kwargs=None):
-        """Atajo para llamar XML-RPC usando el product_client actual."""
+        """Atajo para llamar XML-RPC usando el product_client actual.
+        Si es una lectura, aplana posibles listas anidadas de IDs para evitar errores de hash.
+        """
         client = self.get_product_client()
+        safe_args = args or []
+        if method == "read" and safe_args and isinstance(safe_args[0], list):
+            safe_args = [self._normalize_id_list(safe_args[0])] + list(safe_args[1:])
         return client.models.execute_kw(
             client.db,
             client.uid,
             client.password,
             model,
             method,
-            args or [],
+            safe_args,
             kwargs or {},
         )
 
@@ -293,6 +327,7 @@ class OdooConnectionManager:
 
     def confirm_purchase_order(self, order_id: int) -> dict:
         """Confirma una cotización y devuelve la orden actualizada."""
+        order_id = self._normalize_id(order_id)
         self._execute_kw("purchase.order", "button_confirm", [[order_id]])
         order = self._execute_kw(
             "purchase.order",
@@ -304,6 +339,7 @@ class OdooConnectionManager:
 
     def get_order_status(self, order_id: int) -> dict:
         """Obtiene estado, recepciones e invoices de una orden."""
+        order_id = self._normalize_id(order_id)
         result = self._execute_kw(
             "purchase.order",
             "read",
@@ -314,9 +350,10 @@ class OdooConnectionManager:
 
     def read_order_lines(self, order_line_ids: list[int]) -> list[dict]:
         """Devuelve las líneas de la orden con SKU, descripción, cantidad y precios."""
+        order_line_ids = self._normalize_id_list(order_line_ids)
         if not order_line_ids:
             return []
-        fields = ["id", "product_id", "name", "product_qty", "price_unit", "price_subtotal"]
+        fields = ["id", "product_id", "name", "product_qty", "price_unit", "price_subtotal", "taxes_id", "product_uom"]
         lines = self._execute_kw("purchase.order.line", "read", [order_line_ids], {"fields": fields})
         product_ids = [line["product_id"][0] for line in lines if line.get("product_id")]
         products = {}
@@ -324,7 +361,7 @@ class OdooConnectionManager:
             product_records = self._execute_kw(
                 "product.product",
                 "read",
-                [list(set(product_ids))],
+                [self._normalize_id_list(list(set(product_ids)))],
                 {"fields": ["id", "default_code", "name"]},
             )
             products = {prod["id"]: prod for prod in product_records}
@@ -340,12 +377,15 @@ class OdooConnectionManager:
                     "precio_unitario": line.get("price_unit", 0.0),
                     "subtotal": line.get("price_subtotal", 0.0),
                     "product_id": line["product_id"][0] if line.get("product_id") else None,
+                    "tax_ids": self._normalize_id_list(line.get("taxes_id") or []),
+                    "product_uom": self._normalize_id(line.get("product_uom")),
                 }
             )
         return parsed
 
     def read_order(self, order_id: int) -> dict:
         """Lee la orden de compra con sus totales y referencias clave."""
+        order_id = self._normalize_id(order_id)
         result = self._execute_kw(
             "purchase.order",
             "read",
@@ -356,6 +396,7 @@ class OdooConnectionManager:
 
     def read_receipts_for_order(self, picking_ids: list[int]) -> list[dict]:
         """Lee los pickings asociados y devuelve cantidades recepcionadas y ubicación."""
+        picking_ids = self._normalize_id_list(picking_ids)
         if not picking_ids:
             return []
         pickings = self._execute_kw(
@@ -366,7 +407,8 @@ class OdooConnectionManager:
         )
         move_ids: List[int] = []
         for picking in pickings:
-            move_ids.extend(picking.get("move_ids_without_package", []))
+            move_ids.extend(self._normalize_id_list(picking.get("move_ids_without_package", [])))
+        move_ids = self._normalize_id_list(move_ids)
         if not move_ids:
             return []
         try:
@@ -404,14 +446,14 @@ class OdooConnectionManager:
         product = self._execute_kw(
             "product.product",
             "read",
-            [[product_id]],
+            [[int(product_id)]],
             {"fields": ["type", "categ_id"]},
         )[0]
         category_name = product["categ_id"][1] if product.get("categ_id") else ""
         return "materia_prima" if "Materia Prima" in category_name else "producto"
 
     def update_order_line(self, line_id: int, values: dict) -> None:
-        self._execute_kw("purchase.order.line", "write", [[line_id], values])
+        self._execute_kw("purchase.order.line", "write", [[int(line_id)], values])
 
     def recompute_order_amounts(self, order_id: int) -> None:
         """Recalcula los totales usando la lógica estándar de Odoo."""
@@ -429,6 +471,25 @@ class OdooConnectionManager:
             raise RuntimeError("No se encontró una unidad de medida en Odoo para crear productos.")
         self._default_uom_id = uom_ids[0]
         return self._default_uom_id
+
+    def _get_product_details(self, product_id: int) -> dict:
+        """Lee datos básicos del producto necesarios para crear líneas."""
+        product_id = self._normalize_id(product_id)
+        products = self._execute_kw(
+            "product.product",
+            "read",
+            [[product_id]],
+            {"fields": ["uom_po_id", "uom_id", "supplier_taxes_id"]},
+        )
+        return products[0] if products else {}
+
+    def _get_line_taxes(self, product_taxes: List[Any]) -> List[int]:
+        taxes = self._normalize_id_list(product_taxes or [])
+        if taxes:
+            return taxes
+        if self._default_purchase_tax_ids:
+            return self._default_purchase_tax_ids
+        return []
 
     def _get_default_category_id(self) -> int:
         if self._default_category_id:
@@ -498,12 +559,12 @@ class OdooConnectionManager:
         product = self._execute_kw(
             "product.product",
             "read",
-            [[product_id]],
+            [[self._normalize_id(product_id)]],
             {"fields": ["seller_ids", "product_tmpl_id"]},
         )[0]
-        seller_ids = product.get("seller_ids") or []
+        seller_ids = self._normalize_id_list(product.get("seller_ids") or [])
         template_raw = product.get("product_tmpl_id")
-        template_id = template_raw[0] if template_raw else None
+        template_id = self._normalize_id(template_raw)
         if template_id is None:
             logger.warning("El producto %s no posee plantilla asociada en Odoo.", product_id)
             return
@@ -512,12 +573,13 @@ class OdooConnectionManager:
         supplier_infos = self._execute_kw(
             "product.supplierinfo",
             "read",
-            [seller_ids],
+            [self._normalize_id_list(seller_ids)],
             {"fields": fields_to_read},
         )
         for info in supplier_infos:
             partner_ref = info.get(partner_field)
-            if partner_ref and partner_ref[0] == supplier_id:
+            partner_ref_id = self._normalize_id(partner_ref)
+            if partner_ref_id and partner_ref_id == self._normalize_id(supplier_id):
                 return
         self._create_supplierinfo_record(template_id, product_id, supplier_id, price)
 
@@ -536,12 +598,12 @@ class OdooConnectionManager:
             partner_data = self._execute_kw(
                 "res.partner",
                 "read",
-                [[supplier_id]],
+                [[self._normalize_id(supplier_id)]],
                 {"fields": ["name"]},
             )[0]
-            partner_value: Any = [supplier_id, partner_data.get("name")]
+            partner_value: Any = [self._normalize_id(supplier_id), partner_data.get("name")]
         else:
-            partner_value = supplier_id
+            partner_value = self._normalize_id(supplier_id)
 
         values: Dict[str, Any] = {"price": price, "min_qty": 1, partner_field: partner_value}
 
@@ -561,12 +623,14 @@ class OdooConnectionManager:
             partner = self._execute_kw(
                 "res.partner",
                 "read",
-                [[supplier_id]],
+                [[self._normalize_id(supplier_id)]],
                 {"fields": ["company_id"]},
             )[0]
             company_ref = partner.get("company_id")
             if company_ref:
-                values["company_id"] = company_ref[0]
+                company_id = self._normalize_id(company_ref)
+                if company_id is not None:
+                    values["company_id"] = company_id
 
         self._execute_kw("product.supplierinfo", "create", [[values]])
         logger.info(
@@ -638,31 +702,32 @@ class OdooConnectionManager:
             [[["name", "ilike", supplier_label]]],
             {"limit": 10},
         )
-        selected = self._select_supplier_candidate(supplier_label, partner_ids)
+        selected = self._select_supplier_candidate(supplier_label, self._normalize_id_list(partner_ids))
         if selected:
             # Si existe pero no está marcado como proveedor, se actualiza supplier_rank=1.
             try:
+                selected_id = self._normalize_id(selected)
                 partner = self._execute_kw(
                     "res.partner",
                     "read",
-                    [[selected]],
+                    [[selected_id]],
                     {"fields": ["supplier_rank", "name"]},
                 )[0]
                 if (partner.get("supplier_rank") or 0) < 1:
                     logger.info(
                         "Actualizando supplier_rank=1 para el proveedor existente '%s' (ID %s).",
                         partner.get("name"),
-                        selected,
+                        selected_id,
                     )
                     self._execute_kw(
                         "res.partner",
                         "write",
-                        [[selected], {"supplier_rank": 1}],
+                        [[selected_id], {"supplier_rank": 1}],
                     )
             except Exception as exc:
                 logger.warning(
                     "No se pudo verificar/actualizar supplier_rank del proveedor %s: %s",
-                    selected,
+                    selected_id,
                     exc,
                 )
             return selected
@@ -692,12 +757,17 @@ class OdooConnectionManager:
         line_values: List[dict] = []
         for line in invoice.lines:
             product_id = self.ensure_product_for_supplier(line, partner_id)
+            product_data = self._get_product_details(product_id)
+            taxes = self._get_line_taxes(product_data.get("supplier_taxes_id", []))
+            uom = self._normalize_id(product_data.get("uom_po_id") or product_data.get("uom_id") or self._get_default_uom_id())
             line_values.append(
                 {
                     "name": line.detalle,
                     "product_id": product_id,
                     "product_qty": line.cantidad,
                     "price_unit": line.precio_unitario,
+                    "product_uom": uom,
+                    "taxes_id": [[6, 0, taxes]] if taxes else [],
                     "date_planned": today,
                 }
             )
@@ -731,7 +801,6 @@ class OdooConnectionManager:
             {"fields": ["id", "name", "state", "amount_untaxed", "amount_tax", "amount_total", "order_line", "picking_ids", "partner_id"]},
         )[0]
         return order
-
     
     def confirm_order_receipt(self, order: dict) -> None:
         """Confirma la recepcion de todos los pickings asociados a la orden"""
@@ -746,6 +815,4 @@ class OdooConnectionManager:
         self._execute_kw("purchase.order", "action_create_invoice", [[order_id]])
 
 
-
-    
 odoo_manager = OdooConnectionManager()

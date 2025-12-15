@@ -7,9 +7,10 @@ from rich.logging import RichHandler
 from rich.traceback import install
 
 from .slack_bot import SlackBot
-from ..config import get_settings
+from ..config import get_settings, load_allowed_users
 from ..prompts.prompts import INVOICE_PROMPT
 from ..agents.agent import invoice_agent
+from ..core.models import InvoiceResponseModel
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ def format_messages(text: str, file_path: str, is_new: bool):
 
 def run_slack_bot():
     configure_logging()
+    allowed = load_allowed_users()
     message_queue = Queue()
     slack_bot = SlackBot(
         app_token=settings.slack_app_token,
@@ -71,9 +73,17 @@ def run_slack_bot():
 
     while True:
         payload = message_queue.get()
+        user_id = payload.get("user") or payload.get("user_id")
         event = payload.get("event") or payload  # algunos adaptadores entregan el evento anidado
         inner_message = event.get("message") or {}
         previous_message = inner_message.get("previous_message", {}) or event.get("previous_message", {}) or {}
+
+        # Filtro de usuarios autorizados
+        if allowed.get("enabled"):
+            allowed_ids = {u["id"] if isinstance(u, dict) else u for u in allowed.get("users", [])}
+            if user_id not in allowed_ids:
+                logger.info("Usuario no autorizado: %s; se ignora el evento", user_id)
+                continue
 
         # Datos base del evento
         user_id = event.get("user") or event.get("user_id") or inner_message.get("user") or previous_message.get("user")
@@ -183,16 +193,14 @@ def run_slack_bot():
                 logger.debug("No se pudo agregar reacción de error al mensaje original.")
             continue
         # Prefiere la respuesta estructurada del modelo si existe; evita la conversación interna.
-        structured = getattr(result, "structured_response", None)
-        if structured and hasattr(structured, "summary"):
-            response = structured.summary
-            needs_follow_up = getattr(structured, "needs_follow_up", False)
-        elif hasattr(result, "summary"):
-            response = result.summary
-            needs_follow_up = getattr(result, "needs_follow_up", False)
+        response_model: InvoiceResponseModel | None = _coerce_response_model(result)
+        if response_model:
+            response = response_model.summary
+            needs_follow_up = bool(response_model.needs_follow_up)
         else:
-            response = str(result)
-            needs_follow_up = False
+            # Evita enviar conversación interna u objetos desconocidos.
+            response = "No se pudo procesar la factura; revisa Odoo manualmente."
+            needs_follow_up = True
 
         # Reacciona en el mensaje original: verde si todo OK y se cerró flujo; rojo + mensaje si hay follow-up.
         if not needs_follow_up:
@@ -200,7 +208,12 @@ def run_slack_bot():
                 add_reaction(channel, timestamp, "white_check_mark")
             except Exception:
                 logger.debug("No se pudo agregar reacción de éxito al mensaje original.")
-            # No enviamos texto adicional cuando todo está OK.
+            # Enviar también el resumen de lo que se hizo.
+            try:
+                post_message(channel, response, timestamp)
+            except Exception as exc:
+                logger.error("No se pudo enviar mensaje a Slack: %s", exc)
+                logger.debug("Respuesta que falló: %s", response)
             continue
         else:
             try:
@@ -271,3 +284,46 @@ def _fetch_files_from_slack(channel: str | None, ts: str | None):
     except Exception as exc:
         logger.warning("No se pudieron recuperar archivos desde Slack: %s", exc)
         return []
+def _coerce_response_model(result) -> InvoiceResponseModel | None:
+    """Intenta extraer InvoiceResponseModel desde distintos formatos de resultado."""
+    try:
+        if isinstance(result, InvoiceResponseModel):
+            return result
+
+        # Caso atributo structured_response
+        structured = getattr(result, "structured_response", None)
+        if structured:
+            if isinstance(structured, InvoiceResponseModel):
+                return structured
+            try:
+                return InvoiceResponseModel.model_validate(structured)
+            except Exception:
+                pass
+
+        # Caso dict con structured_response o campos del modelo
+        if isinstance(result, dict):
+            if "structured_response" in result:
+                try:
+                    return InvoiceResponseModel.model_validate(result["structured_response"])
+                except Exception:
+                    pass
+            try:
+                return InvoiceResponseModel.model_validate(result)
+            except Exception:
+                pass
+
+        # Caso atributo dict interno
+        if hasattr(result, "__dict__"):
+            data = result.__dict__
+            if "structured_response" in data:
+                try:
+                    return InvoiceResponseModel.model_validate(data["structured_response"])
+                except Exception:
+                    pass
+            try:
+                return InvoiceResponseModel.model_validate(data)
+            except Exception:
+                pass
+    except Exception:
+        return None
+    return None

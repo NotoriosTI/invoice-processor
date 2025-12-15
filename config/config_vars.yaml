@@ -20,6 +20,11 @@ variables:
     type: str
     default: "gpt-4o-mini"
 
+  DEFAULT_PURCHASE_TAX_IDS:
+    source: DEFAULT_PURCHASE_TAX_IDS
+    type: str
+    default: ""
+
   SLACK_APP_TOKEN:
     source: INVOICE_SLACK_APP_TOKEN
     type: str
@@ -48,6 +53,7 @@ validation:
     - SLACK_BOT_TOKEN
     - DATA_PATH
   optional:
+    - DEFAULT_PURCHASE_TAX_IDS
     - LLM_MODEL
     - SLACK_DEBUG_LOGS
   strict: false

@@ -1,0 +1,5 @@
+slack_access:
+  enable: true
+  users:
+    - id: U0A172UPR1B
+      name: tomás

@@ -155,6 +155,77 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     compara cabecera y líneas, verifica recepción y construye el resumen final.
     """
     invoice = extract_invoice_data(image_path)
+
+    # Ajuste por descuento global: prorrateo equitativo en todas las líneas.
+    descuento_global = getattr(invoice, "descuento_global", 0.0) or 0.0
+    if descuento_global > 0 and invoice.lines:
+        partes = len(invoice.lines)
+        descuento_por_linea = descuento_global / partes if partes else 0.0
+        adjusted_lines: List[InvoiceLine] = []
+        for line in invoice.lines:
+            nuevo_subtotal = max(line.subtotal - descuento_por_linea, 0.0)
+            nuevo_precio = nuevo_subtotal / line.cantidad if line.cantidad else line.precio_unitario
+            adjusted_lines.append(
+                line.model_copy(
+                    update={
+                        "subtotal": nuevo_subtotal,
+                        "precio_unitario": nuevo_precio,
+                    }
+                )
+            )
+        recalculated_neto = sum(l.subtotal for l in adjusted_lines)
+        # Verifica que el neto ajustado cuadre con la cabecera; si no, detiene el flujo.
+        if abs(recalculated_neto - invoice.neto) > 1.0:
+            return InvoiceResponseModel(
+                summary=(
+                    f"No se pudo aplicar el descuento global correctamente: "
+                    f"neto cabecera {invoice.neto} vs neto recalculado {recalculated_neto}."
+                ),
+                products=[],
+                needs_follow_up=True,
+                neto_match=False,
+                iva_match=False,
+                total_match=False,
+            )
+        iva_ajustado = recalculated_neto * 0.19
+        total_ajustado = recalculated_neto + iva_ajustado
+        invoice = invoice.model_copy(
+            update={
+                "lines": adjusted_lines,
+                "neto": recalculated_neto,
+                "iva_19": iva_ajustado,
+                "total": total_ajustado,
+            }
+        )
+        # Si ya prorrateamos descuento, no volver a ajustar por IVA incluido.
+        skip_iva_incluido = True
+    else:
+        skip_iva_incluido = False
+
+    # Caso especial: subtotales de líneas vienen con IVA incluido.
+    # Si la suma de subtotales ≈ TOTAL y TOTAL ≈ NETO + IVA, recalculamos subtotales netos.
+    if not skip_iva_incluido:
+        sum_subtotales = sum(line.subtotal for line in invoice.lines)
+        if (
+            sum_subtotales > 0
+            and abs(sum_subtotales - invoice.total) <= 1.0
+            and abs((invoice.neto + invoice.iva_19) - invoice.total) <= 1.0
+        ):
+            factor = invoice.neto / sum_subtotales if sum_subtotales else 1.0
+            adjusted_lines: List[InvoiceLine] = []
+            for line in invoice.lines:
+                subtotal_neto = line.subtotal * factor
+                precio_unitario_neto = subtotal_neto / line.cantidad if line.cantidad else line.precio_unitario
+                adjusted_lines.append(
+                    line.model_copy(
+                        update={
+                            "subtotal": subtotal_neto,
+                            "precio_unitario": precio_unitario_neto,
+                        }
+                    )
+                )
+            invoice = invoice.model_copy(update={"lines": adjusted_lines})
+
     # Normaliza líneas si subtotal y precio unitario no son consistentes.
     normalized_lines: List[InvoiceLine] = []
     for line in invoice.lines:
@@ -171,6 +242,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     if not invoice.lines:
         raise ValueError("La factura no contiene líneas de productos para comparar.")
     order = _load_purchase_order(invoice)
+
     summary = _build_order_summary(order)
 
     # Preprocesa recepciones solo para validar cantidades
@@ -237,23 +309,41 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 0.5
     total_match = abs(summary["total"] - invoice.total) <= 0.5
 
-    summary_lines = [
-        f"Neto: {'OK' if neto_match else 'ISSUE'} (Factura {invoice.neto}, Odoo {summary['neto']})",
-        f"19% IVA: {'OK' if iva_match else 'ISSUE'} (Factura {invoice.iva_19}, Odoo {summary['iva_19']})",
-        f"Total: {'OK' if total_match else 'ISSUE'} (Factura {invoice.total}, Odoo {summary['total']})",
-    ]
-    for product in products:
-        status = "OK" if not product.issues else "ISSUE"
-        summary_lines.append(f"- {product.detalle}: {status}")
-        if product.issues:
-            summary_lines.append(f"  → {product.issues}")
+    # Tolerancia de redondeo: si todas las líneas están OK y la diferencia en cabecera es <= 1 peso,
+    # consideramos coincidencia de neto, IVA y total.
+    header_neto_diff = abs(summary["neto"] - invoice.neto)
+    header_iva_diff = abs(summary["iva_19"] - invoice.iva_19)
+    header_total_diff = abs(summary["total"] - invoice.total)
+    all_lines_ok = all(not p.issues for p in products)
+    if all_lines_ok and header_neto_diff <= 1.0 and header_iva_diff <= 1.0 and header_total_diff <= 1.0:
+        neto_match = True
+        iva_match = True
+        total_match = True
 
     needs_follow_up = any(p.issues for p in products) or not (neto_match and iva_match and total_match)
 
+    # Construye resumen breve según caso.
     if not needs_follow_up:
         try:
             _finalize_order(order)
-            summary_lines.append("✅ La orden fue recepcionada y facturada automáticamente en Odoo.")
+            if order.get("_created_from_invoice"):
+                final_summary = (
+                    f"Se creó la orden de compra (ID {order['id']}). "
+                    f"Se recepcionó y facturó correctamente."
+                )
+            else:
+                final_summary = (
+                    f"Se editó la orden de compra (ID {order['id']}). "
+                    f"Se recepcionó y facturó correctamente."
+                )
+            return InvoiceResponseModel(
+                summary=final_summary,
+                products=products,
+                needs_follow_up=False,
+                neto_match=neto_match,
+                iva_match=iva_match,
+                total_match=total_match,
+            )
         except Exception as exc:
             logger.error(f"No se pudo cerrar automáticamente la orden {order['name']}: {exc}")
             error_summary = "No se pudo crear/editar OC, revisar Odoo manualmente."
@@ -276,10 +366,33 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                 total_match=total_match,
             )
 
+    # Construye resumen detallado de discrepancias.
+    discrepancy_parts: List[str] = []
+    if not neto_match:
+        discrepancy_parts.append(
+            f"Neto no coincide (Factura {invoice.neto} vs Odoo {summary['neto']})."
+        )
+    if not iva_match:
+        discrepancy_parts.append(
+            f"IVA 19% no coincide (Factura {invoice.iva_19} vs Odoo {summary['iva_19']})."
+        )
+    if not total_match:
+        discrepancy_parts.append(
+            f"Total no coincide (Factura {invoice.total} vs Odoo {summary['total']})."
+        )
+    for product in products:
+        if product.issues:
+            discrepancy_parts.append(f"{product.detalle}: {product.issues}")
+
+    if discrepancy_parts:
+        discrepancy_msg = "No se pudo procesar la factura: " + " ".join(discrepancy_parts)
+    else:
+        discrepancy_msg = "No se pudo procesar la factura; revisa manualmente en Odoo."
+
     return InvoiceResponseModel(
-        summary="\n".join(summary_lines),
+        summary=discrepancy_msg,
         products=products,
-        needs_follow_up=needs_follow_up,
+        needs_follow_up=True,
         neto_match=neto_match,
         iva_match=iva_match,
         total_match=total_match,
