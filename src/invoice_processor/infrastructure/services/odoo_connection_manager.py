@@ -1,4 +1,6 @@
 import logging
+import re
+import unicodedata
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 from odoo_api import OdooProduct, OdooWarehouse, OdooSupply
@@ -193,17 +195,32 @@ class OdooConnectionManager:
             kwargs or {},
         )
 
+    def _normalize_vat(self, vat: Optional[str]) -> Optional[str]:
+        if not vat:
+            return None
+        cleaned = "".join(ch for ch in vat if ch.isalnum()).upper()
+        return cleaned or None
+
     def find_purchase_order_by_similarity(
         self,
         supplier_name: Optional[str],
         invoice_details: List[str],
         invoice_total: float,
         limit: int = 20,
+        supplier_rut: Optional[str] = None,
     ) -> Optional[dict]:
         """Busca la OC más parecida combinando proveedor (nombre) y líneas."""
         domain: List[list] = [["state", "in", ["draft", "sent", "purchase", "done"]]]
         partner_ids: List[int] = []
-        if supplier_name:
+        normalized_rut = self._normalize_vat(supplier_rut)
+        if normalized_rut:
+            partner_ids = self._execute_kw(
+                "res.partner",
+                "search",
+                [[["vat", "=", normalized_rut]]],
+                {"limit": 5},
+            )
+        if supplier_name and not partner_ids:
             partner_ids = self._execute_kw(
                 "res.partner",
                 "search",
@@ -527,33 +544,195 @@ class OdooConnectionManager:
             return "product_id"
         raise RuntimeError("No hay un campo para asociar el producto en product.supplierinfo.")
 
-    def _find_product_candidate(self, detail: str) -> Optional[int]:
-        product_ids = self._execute_kw(
-            "product.product",
-            "search",
-            [[["name", "ilike", detail]]],
-            {"limit": 5},
-        )
+    def _find_product_candidate(self, invoice_line: "InvoiceLine") -> Optional[int]:
+        def _normalize(text: str) -> str:
+            if not text:
+                return ""
+            text = text.lower()
+            text = re.sub(r"\[[^\]]+\]", " ", text)
+            text = "".join(
+                ch
+                for ch in unicodedata.normalize("NFD", text)
+                if unicodedata.category(ch) != "Mn"
+            )
+            text = re.sub(r"[^a-z0-9\s]", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text
+
+        def _tokens(text: str) -> List[str]:
+            stopwords = {
+                "mp",
+                "aceite",
+                "aceites",
+                "esencial",
+                "esenciales",
+                "exfoliantes",
+                "semillas",
+                "harinas",
+                "producto",
+                "materia",
+                "prima",
+                "efervescentes",
+                "sales",
+                "sello",
+                "tapa",
+                "vidrio",
+                "transparente",
+                "pote",
+                "crema",
+                "blanca",
+                "mesh",
+                "saco",
+                "kg",
+                "g",
+                "gr",
+                "ml",
+                "l",
+                "lt",
+            }
+            parts = [_normalize(text)]
+            if parts and parts[0]:
+                words = [w for w in parts[0].split() if w and w not in stopwords]
+            else:
+                words = []
+            return words
+
+        def _extract_quantity(text: str) -> Optional[Tuple[float, str]]:
+            pattern = re.compile(r"(\d+(?:[\.,]\d+)?)\s*(kg|g|gr|gramos?|ml|l|lt|cc)", re.IGNORECASE)
+            match = pattern.search(text or "")
+            if not match:
+                return None
+            raw_val = match.group(1).replace(",", ".")
+            try:
+                val = float(raw_val)
+            except ValueError:
+                return None
+            unit = match.group(2).lower()
+            if unit in {"kg"}:
+                return val * 1000.0, "g"
+            if unit in {"l", "lt"}:
+                return val * 1000.0, "ml"
+            if unit == "cc":
+                return val, "cc"
+            return val, unit
+
+        def _normalize_unit(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return None
+            unit = value.strip().lower()
+            mapping = {
+                "kg": {"kg", "kilo", "kilos"},
+                "g": {"g", "gr", "gramo", "gramos"},
+                "l": {"l", "lt", "litro", "litros"},
+                "ml": {"ml", "mililitro", "mililitros"},
+                "unidad": {"unidad", "unidades", "ud", "uds", "un"},
+                "saco": {"saco", "sacos"},
+                "caja": {"caja", "cajas"},
+            }
+            for norm, variants in mapping.items():
+                if unit in variants:
+                    return norm
+            return unit
+
+        def _score_candidate(
+            target_norm: str,
+            cand_norm: str,
+            target_tokens: List[str],
+            cand_tokens: List[str],
+            target_qty,
+            cand_qty,
+            target_unit: Optional[str],
+        ) -> float:
+            base = SequenceMatcher(None, target_norm, cand_norm).ratio()
+            if target_tokens:
+                overlap = len(set(target_tokens) & set(cand_tokens))
+                token_score = overlap / max(len(target_tokens), 1)
+            else:
+                token_score = 0.0
+            qty_bonus = 0.0
+            if target_qty and cand_qty:
+                t_val, t_unit = target_qty
+                c_val, c_unit = cand_qty
+                if t_unit == c_unit and t_val > 0:
+                    diff = abs(t_val - c_val) / t_val
+                    if diff <= 0.1:
+                        qty_bonus = 0.1
+            unit_bonus = 0.0
+            cand_unit = cand_qty[1] if cand_qty else None
+            if target_unit and cand_unit and target_unit == cand_unit:
+                unit_bonus = 0.1
+            return base * 0.2 + token_score * 0.6 + qty_bonus + unit_bonus
+
+        detail = invoice_line.detalle if hasattr(invoice_line, "detalle") else ""
+        target_norm = _normalize(detail)
+        target_tokens = _tokens(detail)
+        target_qty = _extract_quantity(detail)
+        target_unit = _normalize_unit(getattr(invoice_line, "unidad", None))
+
+        search_terms = {detail}
+        if target_tokens:
+            search_terms.add(" ".join(target_tokens[:2]))
+            for tok in target_tokens:
+                if len(tok) >= 3:
+                    search_terms.add(tok)
+
+        product_ids: set[int] = set()
+        for term in search_terms:
+            if not term:
+                continue
+            try:
+                ids = self._execute_kw(
+                    "product.product",
+                    "search",
+                    [[["name", "ilike", term]]],
+                    {"limit": 10},
+                )
+                product_ids.update(ids)
+            except Exception:
+                continue
+
         if not product_ids:
             return None
+
         products = self._execute_kw(
             "product.product",
             "read",
-            [product_ids],
-            {"fields": ["id", "name"]},
+            [self._normalize_id_list(list(product_ids))],
+            {"fields": ["id", "name", "default_code"]},
         )
         if not products:
             return None
-        best_product = max(
-            products,
-            key=lambda prod: self._string_similarity(detail, prod.get("name", "")),
-        )
-        logger.info(
-            "Producto detectado por similitud: %s (ID %s)",
-            best_product.get("name"),
-            best_product.get("id"),
-        )
-        return best_product.get("id")
+
+        best_product = None
+        best_score = 0.0
+        best_token_score = 0.0
+        for prod in products:
+            cand_name = prod.get("name") or ""
+            cand_norm = _normalize(cand_name)
+            cand_tokens = _tokens(cand_name)
+            cand_qty = _extract_quantity(cand_name)
+            score = _score_candidate(target_norm, cand_norm, target_tokens, cand_tokens, target_qty, cand_qty, target_unit)
+            if target_tokens:
+                overlap = len(set(target_tokens) & set(cand_tokens))
+                token_cov = overlap / max(len(target_tokens), 1)
+            else:
+                token_cov = 0.0
+            if score > best_score:
+                best_score = score
+                best_product = prod
+                best_token_score = token_cov
+
+        # Requiere buena cobertura de tokens aunque el ratio de cadena sea bajo.
+        if best_product and (best_score >= 0.65 or best_token_score >= 0.7):
+            logger.info(
+                "Producto detectado por similitud: %s (ID %s, score %.2f, token_cov %.2f)",
+                best_product.get("name"),
+                best_product.get("id"),
+                best_score,
+                best_token_score,
+            )
+            return best_product.get("id")
+        return None
 
     def _ensure_supplier_on_product(self, product_id: int, supplier_id: int, price: float) -> None:
         product = self._execute_kw(
@@ -641,7 +820,7 @@ class OdooConnectionManager:
 
     def ensure_product_for_supplier(self, invoice_line: "InvoiceLine", supplier_id: int) -> int:
         """Garantiza que exista un product_id compatible con el proveedor."""
-        product_id = self._find_product_candidate(invoice_line.detalle)
+        product_id = self._find_product_candidate(invoice_line)
         if product_id:
             self._ensure_supplier_on_product(product_id, supplier_id, invoice_line.precio_unitario)
             return product_id
@@ -694,14 +873,24 @@ class OdooConnectionManager:
             return best_partner.get("id")
         return None
 
-    def _find_or_create_supplier(self, supplier_name: str) -> int:
+    def _find_or_create_supplier(self, supplier_name: str, supplier_rut: Optional[str] = None) -> int:
         supplier_label = (supplier_name or "Proveedor Desconocido").strip()
-        partner_ids = self._execute_kw(
-            "res.partner",
-            "search",
-            [[["name", "ilike", supplier_label]]],
-            {"limit": 10},
-        )
+        normalized_rut = self._normalize_vat(supplier_rut)
+        partner_ids: List[int] = []
+        if normalized_rut:
+            partner_ids = self._execute_kw(
+                "res.partner",
+                "search",
+                [[["vat", "=", normalized_rut]]],
+                {"limit": 10},
+            )
+        if not partner_ids:
+            partner_ids = self._execute_kw(
+                "res.partner",
+                "search",
+                [[["name", "ilike", supplier_label]]],
+                {"limit": 10},
+            )
         selected = self._select_supplier_candidate(supplier_label, self._normalize_id_list(partner_ids))
         if selected:
             # Si existe pero no está marcado como proveedor, se actualiza supplier_rank=1.
@@ -736,10 +925,13 @@ class OdooConnectionManager:
             supplier_label,
         )
         try:
+            values = {"name": supplier_label, "company_type": "company", "supplier_rank": 1}
+            if normalized_rut:
+                values["vat"] = normalized_rut
             return self._execute_kw(
                 "res.partner",
                 "create",
-                [[{"name": supplier_label, "company_type": "company", "supplier_rank": 1}]],
+                [[values]],
             )
         except Exception as exc:
             logger.error("No fue posible crear el proveedor %s: %s", supplier_label, exc)
@@ -752,14 +944,34 @@ class OdooConnectionManager:
         Crea una orden de compra en Odoo usando la información extraída de la factura.
         Retorna la orden confirmada.
         """
-        partner_id = self._find_or_create_supplier(invoice.supplier_name or "Proveedor Desconocido")
+        def _create_order_via_xmlrpc(values: Dict[str, Any]) -> int:
+            return self._execute_kw(
+                "purchase.order",
+                "create",
+                [values],
+            )
+
+        def _create_lines_via_xmlrpc(order_id: int, lines_payload: List[dict]) -> None:
+            for payload in lines_payload:
+                payload["order_id"] = order_id
+                self._execute_kw("purchase.order.line", "create", [[payload]])
+
+        partner_id = self._find_or_create_supplier(invoice.supplier_name or "Proveedor Desconocido", getattr(invoice, "supplier_rut", None))
         today = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         line_values: List[dict] = []
         for line in invoice.lines:
             product_id = self.ensure_product_for_supplier(line, partner_id)
+            product_id = self._normalize_id(product_id)
+            if product_id is None:
+                raise RuntimeError(f"No se pudo determinar product_id para la línea '{line.detalle}'.")
             product_data = self._get_product_details(product_id)
             taxes = self._get_line_taxes(product_data.get("supplier_taxes_id", []))
             uom = self._normalize_id(product_data.get("uom_po_id") or product_data.get("uom_id") or self._get_default_uom_id())
+            if not taxes:
+                logger.warning(
+                    "La línea '%s' no tiene impuestos de compra; usa fallback vacío. Configura DEFAULT_PURCHASE_TAX_IDS si corresponde.",
+                    line.detalle,
+                )
             line_values.append(
                 {
                     "name": line.detalle,
@@ -767,10 +979,23 @@ class OdooConnectionManager:
                     "product_qty": line.cantidad,
                     "price_unit": line.precio_unitario,
                     "product_uom": uom,
-                    "taxes_id": [[6, 0, taxes]] if taxes else [],
+                    "taxes_id": taxes or [],
                     "date_planned": today,
                 }
             )
+        # Sanitiza payload de líneas: product_id/product_uom como int y taxes_id como lista de ints.
+        sanitized_lines: List[dict] = []
+        for lv in line_values:
+            sanitized_lines.append(
+                {
+                    **lv,
+                    "product_id": self._normalize_id(lv.get("product_id")),
+                    "product_uom": self._normalize_id(lv.get("product_uom")),
+                    "taxes_id": self._normalize_id_list(lv.get("taxes_id") or []),
+                }
+            )
+        line_values = sanitized_lines
+        logger.debug("Payload OdooSupply line_values=%s", line_values)
 
         supply = self.get_supply_client()
         logger.info(
@@ -789,10 +1014,28 @@ class OdooConnectionManager:
         except ValueError:
             raise
         except Exception as exc:
-            logger.error("Error al crear la orden en Odoo usando OdooSupply: %s", exc)
-            raise RuntimeError(
-                "Odoo rechazó la creación de la orden. Revisa los datos del proveedor/producto e intenta nuevamente."
-            ) from exc
+            logger.error("Error al crear la orden en Odoo usando OdooSupply: %s", exc, exc_info=True)
+            # Fallback a XML-RPC directo para evitar errores de cliente (p.ej. unhashable list)
+            try:
+                order_vals = {
+                    "partner_id": partner_id,
+                    "date_order": today,
+                    "origin": invoice.supplier_name,
+                    "order_line": [],
+                }
+                order_id = _create_order_via_xmlrpc(order_vals)
+                _create_lines_via_xmlrpc(order_id, line_values)
+                logger.info("Orden creada vía XML-RPC fallback (ID %s) tras fallo en OdooSupply.", order_id)
+                try:
+                    order = self.confirm_purchase_order(order_id)
+                    logger.info("Orden confirmada vía fallback (ID %s, estado %s).", order_id, order.get("state"))
+                except Exception as confirm_exc:
+                    logger.warning("No se pudo confirmar la orden creada por fallback (ID %s): %s", order_id, confirm_exc)
+            except Exception as fallback_exc:
+                logger.error("Fallback XML-RPC también falló: %s", fallback_exc, exc_info=True)
+                raise RuntimeError(
+                    f"Odoo rechazó la creación de la orden. Detalle: {exc}"
+                ) from exc
 
         order = self._execute_kw(
             "purchase.order",

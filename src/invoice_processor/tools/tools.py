@@ -15,7 +15,7 @@ class ProcessInvoiceArgs(BaseModel):
 
 @tool("parse_invoice_image", args_schema=ParseInvoiceArgs)
 def parse_invoice_image(image_path: str) -> InvoiceData:
-    """Extrae solo CANT, DETALLE, P. UNITARIO, subtotal por línea, NETO, IVA 19% y TOTAL."""
+    """Extrae proveedor, RUT, descuento_global, descuentos por línea, CANT, DETALLE, P. UNITARIO, subtotal por línea, NETO, IVA 19% y TOTAL."""
     return extract_invoice_data(image_path)
 
 

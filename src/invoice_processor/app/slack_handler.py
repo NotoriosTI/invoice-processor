@@ -8,7 +8,7 @@ from rich.traceback import install
 
 from .slack_bot import SlackBot
 from ..config import get_settings, load_allowed_users
-from ..prompts.prompts import INVOICE_PROMPT
+from ..prompts import INVOICE_PROMPT
 from ..agents.agent import invoice_agent
 from ..core.models import InvoiceResponseModel
 

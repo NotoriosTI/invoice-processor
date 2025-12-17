@@ -1,7 +1,10 @@
 from typing import Dict, List
 import logging
+import re
+import unicodedata
 from rich.logging import RichHandler
 from rich.traceback import install
+from difflib import SequenceMatcher
 
 from ..infrastructure.services.odoo_connection_manager import odoo_manager
 from .models import InvoiceData, InvoiceLine, ProcessedProduct, InvoiceResponseModel
@@ -17,6 +20,30 @@ if not logging.getLogger().handlers:
 
 logger = logging.getLogger(__name__)
 ocr_client = InvoiceOcrClient()
+
+
+def _apply_line_discounts(invoice: InvoiceData) -> InvoiceData:
+    """Aplica descuentos por línea (% o monto) recalculando subtotal y precio unitario neto."""
+    adjusted_lines: List[InvoiceLine] = []
+    for line in invoice.lines:
+        pct = line.descuento_pct or 0.0
+        monto = line.descuento_monto or 0.0
+        if pct or monto:
+            factor = max(0.0, 1.0 - (pct / 100.0))
+            subtotal_desc = line.precio_unitario * line.cantidad * factor
+            subtotal_desc = max(subtotal_desc - monto, 0.0)
+            precio_neto = subtotal_desc / line.cantidad if line.cantidad else line.precio_unitario
+            adjusted_lines.append(
+                line.model_copy(
+                    update={
+                        "subtotal": subtotal_desc,
+                        "precio_unitario": precio_neto,
+                    }
+                )
+            )
+        else:
+            adjusted_lines.append(line)
+    return invoice.model_copy(update={"lines": adjusted_lines})
 
 
 def extract_invoice_data(image_path: str) -> InvoiceData:
@@ -44,6 +71,7 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
         invoice.supplier_name,
         invoice_details,
         invoice.total,
+        supplier_rut=getattr(invoice, "supplier_rut", None),
     )
     if order:
         logger.info(f"Orden candidata en Odoo: {order.get('name')} (ID {order.get('id')})")
@@ -103,10 +131,40 @@ def _build_order_summary(order: dict) -> Dict[str, any]:
 
 
 def _match_line(invoice_line: InvoiceLine, order_lines: List[dict]) -> dict | None:
-    """Encuentra la línea de Odoo cuyo DETALLE coincida con la línea de factura."""
+    """Encuentra la línea de Odoo cuyo DETALLE coincida con la línea de factura, con fallback por similitud."""
+    def _normalize(text: str) -> str:
+        if not text:
+            return ""
+        text = text.lower()
+        text = re.sub(r"\[[^\]]+\]", " ", text)
+        text = "".join(
+            ch
+            for ch in unicodedata.normalize("NFD", text)
+            if unicodedata.category(ch) != "Mn"
+        )
+        text = re.sub(r"[^a-z0-9\s]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    target_raw = (invoice_line.detalle or "").strip()
+    target = _normalize(target_raw)
+    best_line = None
+    best_score = 0.0
     for line in order_lines:
-        if (line["detalle"] or "").strip().lower() == invoice_line.detalle.strip().lower():
+        candidate_raw = (line.get("detalle") or "").strip()
+        candidate = _normalize(candidate_raw)
+        if candidate_raw.lower() == target_raw.lower():
             return line
+        if target and candidate and (target in candidate or candidate in target):
+            best_line = line
+            best_score = 1.0
+            return line
+        score = SequenceMatcher(None, target, candidate).ratio()
+        if score > best_score:
+            best_score = score
+            best_line = line
+    if best_score >= 0.5:
+        return best_line
     return None
 
 
@@ -155,7 +213,16 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     compara cabecera y líneas, verifica recepción y construye el resumen final.
     """
     invoice = extract_invoice_data(image_path)
+    ocr_dudoso = getattr(invoice, "ocr_dudoso", False)
+    ocr_warning = getattr(invoice, "ocr_warning", None)
+    if not invoice.supplier_name or not invoice.supplier_rut:
+        ocr_dudoso = True
+        warn_missing = "Proveedor o RUT faltante/ilegible en OCR."
+        ocr_warning = f"{ocr_warning}; {warn_missing}" if ocr_warning else warn_missing
+    invoice = _apply_line_discounts(invoice)
 
+    descuento_global_aplicado = False
+    iva_incluido_detectado = False
     # Ajuste por descuento global: prorrateo equitativo en todas las líneas.
     descuento_global = getattr(invoice, "descuento_global", 0.0) or 0.0
     if descuento_global > 0 and invoice.lines:
@@ -199,6 +266,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         )
         # Si ya prorrateamos descuento, no volver a ajustar por IVA incluido.
         skip_iva_incluido = True
+        descuento_global_aplicado = True
     else:
         skip_iva_incluido = False
 
@@ -225,12 +293,26 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                     )
                 )
             invoice = invoice.model_copy(update={"lines": adjusted_lines})
+            iva_incluido_detectado = True
 
     # Normaliza líneas si subtotal y precio unitario no son consistentes.
     normalized_lines: List[InvoiceLine] = []
     for line in invoice.lines:
         expected_subtotal = line.precio_unitario * line.cantidad
-        if abs(expected_subtotal - line.subtotal) > 0.01 and line.cantidad != 0:
+        if abs(expected_subtotal - line.subtotal) > 1.0 and line.cantidad != 0:
+            # Prefiere ajustar subtotal a cantidad x precio; recalcula precio unitario coherente.
+            corrected_subtotal = expected_subtotal
+            corrected_price = corrected_subtotal / line.cantidad
+            normalized_lines.append(
+                line.model_copy(
+                    update={
+                        "subtotal": corrected_subtotal,
+                        "precio_unitario": corrected_price,
+                    }
+                )
+            )
+        elif abs(expected_subtotal - line.subtotal) > 0.01 and line.cantidad != 0:
+            # Ajuste leve: corrige solo precio para que cuadre con subtotal leído.
             corrected_price = line.subtotal / line.cantidad
             normalized_lines.append(
                 line.model_copy(update={"precio_unitario": corrected_price})
@@ -239,9 +321,48 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
             normalized_lines.append(line)
     invoice = invoice.model_copy(update={"lines": normalized_lines})
 
+    # Ajuste menor: si la suma de líneas difiere poco del neto de cabecera, corrige la última línea para cuadrar.
+    sum_lines = sum(l.subtotal for l in invoice.lines)
+    neto_diff = invoice.neto - sum_lines
+    tolerance = max(20.0, abs(invoice.neto) * 0.001)  # $20 o 0.1% del neto
+    if abs(neto_diff) > 0 and abs(neto_diff) <= tolerance and invoice.lines:
+        last = invoice.lines[-1]
+        new_subtotal = last.subtotal + neto_diff
+        new_price = new_subtotal / last.cantidad if last.cantidad else last.precio_unitario
+        adjusted = invoice.lines[:-1] + [
+            last.model_copy(update={"subtotal": new_subtotal, "precio_unitario": new_price})
+        ]
+        invoice = invoice.model_copy(update={"lines": adjusted})
+        sum_lines = sum(l.subtotal for l in invoice.lines)
+
+    if iva_incluido_detectado:
+        header_coherent = abs((invoice.neto + invoice.iva_19) - invoice.total) <= 1.0
+        if header_coherent:
+            ocr_dudoso = False
+            normalize_warning = "Líneas venían con IVA incluido; se normalizaron a valores netos."
+            ocr_warning = f"{ocr_warning}; {normalize_warning}" if ocr_warning else normalize_warning
+
+    if descuento_global_aplicado:
+        header_coherent = abs((invoice.neto + invoice.iva_19) - invoice.total) <= 1.0
+        if header_coherent:
+            ocr_dudoso = False
+            dg_warning = "Se prorrateó descuento_global en las líneas; montos ajustados."
+            ocr_warning = f"{ocr_warning}; {dg_warning}" if ocr_warning else dg_warning
+
     if not invoice.lines:
         raise ValueError("La factura no contiene líneas de productos para comparar.")
-    order = _load_purchase_order(invoice)
+    try:
+        order = _load_purchase_order(invoice)
+    except Exception as exc:
+        warning = f"{ocr_warning}. " if ocr_warning else ""
+        return InvoiceResponseModel(
+            summary=f"No se pudo crear/abrir la orden en Odoo: {warning}{exc}",
+            products=[],
+            needs_follow_up=True,
+            neto_match=False,
+            iva_match=False,
+            total_match=False,
+        )
 
     summary = _build_order_summary(order)
 
@@ -305,9 +426,9 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     odoo_manager.recompute_order_amounts(order["id"])
     # Releer la orden tras las actualizaciones para usar totales y líneas frescos.
     summary = _build_order_summary(order)
-    neto_match = abs(summary["neto"] - invoice.neto) <= 0.5
-    iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 0.5
-    total_match = abs(summary["total"] - invoice.total) <= 0.5
+    neto_match = abs(summary["neto"] - invoice.neto) <= 1.0
+    iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 1.0
+    total_match = abs(summary["total"] - invoice.total) <= 1.0
 
     # Tolerancia de redondeo: si todas las líneas están OK y la diferencia en cabecera es <= 1 peso,
     # consideramos coincidencia de neto, IVA y total.
@@ -321,6 +442,8 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         total_match = True
 
     needs_follow_up = any(p.issues for p in products) or not (neto_match and iva_match and total_match)
+    if ocr_dudoso:
+        needs_follow_up = True
 
     # Construye resumen breve según caso.
     if not needs_follow_up:
@@ -368,6 +491,10 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
 
     # Construye resumen detallado de discrepancias.
     discrepancy_parts: List[str] = []
+    if ocr_dudoso and ocr_warning:
+        discrepancy_parts.append(f"OCR dudoso: {ocr_warning}.")
+    elif ocr_warning:
+        discrepancy_parts.append(f"Advertencia OCR: {ocr_warning}.")
     if not neto_match:
         discrepancy_parts.append(
             f"Neto no coincide (Factura {invoice.neto} vs Odoo {summary['neto']})."

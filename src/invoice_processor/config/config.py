@@ -2,6 +2,7 @@ from functools import lru_cache
 from env_manager import init_config, require_config, get_config
 from pathlib import Path
 import yaml
+import os
 
 PROJECT_ROOT = Path().cwd()
 CONFIG_PATH = PROJECT_ROOT / "config/config_vars.yaml"
@@ -35,6 +36,31 @@ class Settings:
         self.allowed_users_file = get_config("SLACK_ALLOWED_USERS_FILE", "config/allowed_users_config.yaml")
         # Impuestos de compra por defecto (lista de IDs) si una línea no trae impuestos.
         self.default_purchase_tax_ids = get_config("DEFAULT_PURCHASE_TAX_IDS", "")
+        # LangSmith tracing (solo variables LANGSMITH_*)
+        self.langsmith_tracing = get_config("LANGSMITH_TRACING", False)
+        self.langsmith_endpoint = get_config("LANGSMITH_ENDPOINT", None)
+        self.langsmith_api_key = get_config("LANGSMITH_API_KEY", None)
+        self.langsmith_project = get_config("LANGSMITH_PROJECT", None)
+        self.langsmith_project_id = get_config("LANGSMITH_PROJECT_ID", None)
+        self._configure_langsmith_env()
+
+    def _configure_langsmith_env(self) -> None:
+        """Configura variables de entorno para LangSmith sin sobrescribir si ya están seteadas."""
+        if str(self.langsmith_tracing).lower() in {"true", "1", "yes"}:
+            os.environ.setdefault("LANGSMITH_TRACING", "true")
+            # Mapear a las variables que consume LangChain para activar tracing automático.
+            os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+        if self.langsmith_endpoint:
+            os.environ.setdefault("LANGSMITH_ENDPOINT", str(self.langsmith_endpoint))
+            os.environ.setdefault("LANGCHAIN_ENDPOINT", str(self.langsmith_endpoint))
+        if self.langsmith_api_key:
+            os.environ.setdefault("LANGSMITH_API_KEY", str(self.langsmith_api_key))
+            os.environ.setdefault("LANGCHAIN_API_KEY", str(self.langsmith_api_key))
+        if self.langsmith_project:
+            os.environ.setdefault("LANGSMITH_PROJECT", str(self.langsmith_project))
+            os.environ.setdefault("LANGCHAIN_PROJECT", str(self.langsmith_project))
+        if self.langsmith_project_id:
+            os.environ.setdefault("LANGSMITH_PROJECT_ID", str(self.langsmith_project_id))
 
 def load_allowed_users():
     settings = get_settings()

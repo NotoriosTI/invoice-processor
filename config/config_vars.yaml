@@ -37,6 +37,27 @@ variables:
     type: bool
     default: false
 
+  LANGSMITH_TRACING:
+    source: LANGSMITH_TRACING
+    type: bool
+    default: false
+  LANGSMITH_ENDPOINT:
+    source: LANGSMITH_ENDPOINT
+    type: str
+    default: ""
+  LANGSMITH_API_KEY:
+    source: LANGSMITH_API_KEY
+    type: str
+    default: ""
+  LANGSMITH_PROJECT:
+    source: LANGSMITH_PROJECT
+    type: str
+    default: ""
+  LANGSMITH_PROJECT_ID:
+    source: LANGSMITH_PROJECT_ID
+    type: str
+    default: ""
+
   DATA_PATH:
     source: DATA_PATH
     type: str
@@ -56,4 +77,9 @@ validation:
     - DEFAULT_PURCHASE_TAX_IDS
     - LLM_MODEL
     - SLACK_DEBUG_LOGS
+    - LANGSMITH_TRACING
+    - LANGSMITH_ENDPOINT
+    - LANGSMITH_API_KEY
+    - LANGSMITH_PROJECT
+    - LANGSMITH_PROJECT_ID
   strict: false
