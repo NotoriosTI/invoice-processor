@@ -88,7 +88,7 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
     return order
 
 
-def _finalize_order(order: dict) -> None:
+def _finalize_order(order: dict, qty_by_product: Dict[int, float] | None = None) -> None:
     """Confirma la recepción y genera la factura sólo si la orden lo requiere."""
     status = odoo_manager.get_order_status(order["id"])
     state = status.get("state")
@@ -98,7 +98,7 @@ def _finalize_order(order: dict) -> None:
     logger.info(f"Finalizando orden {order['name']} (estado {state}).")
     picking_ids = status.get("picking_ids") or []
     if picking_ids:
-        odoo_manager.confirm_order_receipt({"picking_ids": picking_ids})
+        odoo_manager.confirm_order_receipt({"picking_ids": picking_ids}, qty_by_product=qty_by_product or {})
     else:
         logger.info("La orden %s no tiene recepciones pendientes en Odoo.", order["name"])
     invoice_ids = status.get("invoice_ids") or []
@@ -376,11 +376,17 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         info["quantity"] = float(info["quantity"]) + float(rec.get("quantity_done", 0.0))
 
     products: List[ProcessedProduct] = []
+    qty_by_product: Dict[int, float] = {}
     for line in invoice.lines:
         product_result = _verify_line(line, summary["lines"])
         matched_line = _match_line(line, summary["lines"])
 
         if matched_line and matched_line.get("id"):
+            prod_id = matched_line.get("product_id")
+            if prod_id is not None:
+                norm_pid = odoo_manager._normalize_id(prod_id)
+                if norm_pid is not None:
+                    qty_by_product[norm_pid] = line.cantidad
             desired_values: Dict[str, float] = {}
             if not product_result.cantidad_match:
                 desired_values["product_qty"] = line.cantidad
@@ -448,7 +454,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     # Construye resumen breve según caso.
     if not needs_follow_up:
         try:
-            _finalize_order(order)
+            _finalize_order(order, qty_by_product=qty_by_product)
             if order.get("_created_from_invoice"):
                 final_summary = (
                     f"Se creó la orden de compra (ID {order['id']}). "

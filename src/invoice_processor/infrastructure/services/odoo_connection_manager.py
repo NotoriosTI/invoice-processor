@@ -53,6 +53,10 @@ class OdooConnectionManager:
         self._default_category_id: Optional[int] = None
         self._initialized = True
         self._supplierinfo_fields: Optional[Dict[str, dict]] = None
+        self._tag_cache: Dict[int, str] = {}
+        self._location_cache: Dict[str, Optional[int]] = {}
+        self._has_product_tag_field: Optional[bool] = None
+        self._product_tag_by_product: Dict[int, List[int]] = {}
 
     @staticmethod
     def _normalize_id(value: Any) -> Optional[int]:
@@ -250,6 +254,7 @@ class OdooConnectionManager:
             "order_line",
             "picking_ids",
             "partner_id",
+            "invoice_status",
         ]
         orders = self._execute_kw("purchase.order", "read", [order_ids], {"fields": fields})
 
@@ -262,6 +267,10 @@ class OdooConnectionManager:
         required_matches = max(1, int(len(invoice_details) * MIN_LINE_MATCH_RATIO))
         invoice_total_value = float(invoice_total or 0.0)
         for order in orders:
+            invoice_status = order.get("invoice_status")
+            if invoice_status and str(invoice_status).lower() in {"invoiced", "facturado"}:
+                logger.debug("Descartando orden %s por estado de facturación=%s.", order.get("name"), invoice_status)
+                continue
             lines = self.read_order_lines(order.get("order_line", []))
             product_score, line_scores, matched_lines = self._score_products(invoice_details, lines)
             supplier_score = self._string_similarity(
@@ -370,7 +379,16 @@ class OdooConnectionManager:
         order_line_ids = self._normalize_id_list(order_line_ids)
         if not order_line_ids:
             return []
-        fields = ["id", "product_id", "name", "product_qty", "price_unit", "price_subtotal", "taxes_id", "product_uom"]
+        fields = [
+            "id",
+            "product_id",
+            "name",
+            "product_qty",
+            "price_unit",
+            "price_subtotal",
+            "taxes_id",
+            "product_uom",
+        ]
         lines = self._execute_kw("purchase.order.line", "read", [order_line_ids], {"fields": fields})
         product_ids = [line["product_id"][0] for line in lines if line.get("product_id")]
         products = {}
@@ -420,42 +438,41 @@ class OdooConnectionManager:
             "stock.picking",
             "read",
             [picking_ids],
-            {"fields": ["id", "state", "move_ids_without_package"]},
+            {"fields": ["id", "state", "move_ids_without_package", "location_dest_id"]},
         )
-        move_ids: List[int] = []
-        for picking in pickings:
-            move_ids.extend(self._normalize_id_list(picking.get("move_ids_without_package", [])))
-        move_ids = self._normalize_id_list(move_ids)
-        if not move_ids:
-            return []
-        try:
-            moves = self._execute_kw(
-                "stock.move",
-                "read",
-                [move_ids],
-                {"fields": ["product_id", "product_uom_qty", "quantity_done", "location_dest_id"]},
-            )
-        except Exception as exc:  # algunas versiones no tienen quantity_done
-            if "quantity_done" not in str(exc):
-                raise
-            moves = self._execute_kw(
-                "stock.move",
-                "read",
-                [move_ids],
-                {"fields": ["product_id", "product_uom_qty", "location_dest_id"]},
-            )
         parsed = []
-        for move in moves:
-            qty_done = move.get("quantity_done")
-            if qty_done is None:
-                qty_done = move.get("product_uom_qty", 0.0)
-            parsed.append(
-                {
-                    "product_id": move["product_id"][0] if move.get("product_id") else None,
-                    "quantity_done": qty_done,
-                    "location": move["location_dest_id"][1] if move.get("location_dest_id") else None,
-                }
-            )
+        for picking in pickings:
+            move_ids = self._normalize_id_list(picking.get("move_ids_without_package", []))
+            if not move_ids:
+                continue
+            try:
+                moves = self._execute_kw(
+                    "stock.move",
+                    "read",
+                    [move_ids],
+                    {"fields": ["product_id", "product_uom_qty", "quantity_done", "location_dest_id"]},
+                )
+            except Exception as exc:  # algunas versiones no tienen quantity_done
+                if "quantity_done" not in str(exc):
+                    raise
+                moves = self._execute_kw(
+                    "stock.move",
+                    "read",
+                    [move_ids],
+                    {"fields": ["product_id", "product_uom_qty", "location_dest_id"]},
+                )
+            for move in moves:
+                qty_done = move.get("quantity_done")
+                if qty_done is None:
+                    qty_done = move.get("product_uom_qty", 0.0)
+                parsed.append(
+                    {
+                        "product_id": move["product_id"][0] if move.get("product_id") else None,
+                        "quantity_done": qty_done,
+                        "location": move["location_dest_id"][1] if move.get("location_dest_id") else None,
+                        "location_id": self._normalize_id(move.get("location_dest_id")),
+                    }
+                )
         return parsed
 
     def get_product_type(self, product_id: int) -> str:
@@ -517,6 +534,191 @@ class OdooConnectionManager:
         self._default_category_id = category_ids[0]
         return self._default_category_id
 
+    def _get_location_id_by_name(self, name: str) -> Optional[int]:
+        if name in self._location_cache:
+            return self._location_cache[name]
+        try:
+            ids = self._execute_kw(
+                "stock.location",
+                "search",
+                [[["complete_name", "ilike", name]]],
+                {"limit": 1},
+            )
+            loc_id = self._normalize_id(ids[0]) if ids else None
+            self._location_cache[name] = loc_id
+            return loc_id
+        except Exception as exc:
+            logger.warning("No se pudo resolver ubicación '%s': %s", name, exc)
+            self._location_cache[name] = None
+            return None
+
+    def _product_tags_for_ids(self, product_ids: List[int]) -> Dict[int, List[int]]:
+        """Devuelve tags por product_id leyendo product.product; cachea resultados."""
+        result: Dict[int, List[int]] = {}
+        if self._has_product_tag_field is False:
+            return result
+        if self._has_product_tag_field is None:
+            try:
+                fields = self._execute_kw(
+                    "product.product",
+                    "fields_get",
+                    [],
+                    {"attributes": ["type"]},
+                )
+                self._has_product_tag_field = "product_tag_ids" in fields
+            except Exception:
+                self._has_product_tag_field = False
+        if not self._has_product_tag_field:
+            return result
+
+        to_fetch = []
+        for pid in product_ids or []:
+            pid_norm = self._normalize_id(pid)
+            if pid_norm is None:
+                continue
+            if pid_norm in self._product_tag_by_product:
+                result[pid_norm] = self._product_tag_by_product.get(pid_norm, [])
+            else:
+                to_fetch.append(pid_norm)
+        if not to_fetch:
+            return result
+        try:
+            records = self._execute_kw(
+                "product.product",
+                "read",
+                [to_fetch],
+                {"fields": ["id", "product_tag_ids"]},
+            )
+            for rec in records or []:
+                pid = self._normalize_id(rec.get("id"))
+                tags = self._normalize_id_list(rec.get("product_tag_ids") or [])
+                if pid is not None:
+                    self._product_tag_by_product[pid] = tags
+                    result[pid] = tags
+        except Exception:
+            pass
+        return result
+
+    # --- Helpers de producto basados en OdooProduct (solo lectura/utilidad) ---
+    def product_exists(self, sku: str) -> bool:
+        """Valida existencia de producto por SKU usando OdooProduct si está disponible; fallback a search."""
+        client = self.get_product_client()
+        try:
+            if hasattr(client, "product_exists"):
+                return bool(client.product_exists(sku))
+        except Exception:
+            pass
+        ids = self._execute_kw(
+            "product.product",
+            "search",
+            [[["default_code", "=", str(sku).strip()]]],
+            {"limit": 1},
+        )
+        return bool(ids)
+
+    def get_product_id_by_sku(self, sku: str) -> Optional[int]:
+        """Devuelve product_id por SKU; fallback a search si el helper no está disponible."""
+        client = self.get_product_client()
+        try:
+            if hasattr(client, "get_id_by_sku"):
+                res = client.get_id_by_sku(sku)
+                if isinstance(res, dict):
+                    return self._normalize_id(res.get("product_id"))
+        except Exception:
+            pass
+        ids = self._execute_kw(
+            "product.product",
+            "search",
+            [[["default_code", "=", str(sku).strip()]]],
+            {"limit": 1},
+        )
+        return self._normalize_id(ids[0]) if ids else None
+
+    def get_sku_by_product_id(self, product_id: int) -> Optional[str]:
+        """Devuelve SKU (default_code) por product_id; fallback a search_read."""
+        client = self.get_product_client()
+        try:
+            if hasattr(client, "get_sku_by_id"):
+                res = client.get_sku_by_id(product_id)
+                if isinstance(res, str):
+                    return res
+        except Exception:
+            pass
+        recs = self._execute_kw(
+            "product.product",
+            "search_read",
+            [[["id", "=", self._normalize_id(product_id)]]],
+            {"fields": ["default_code"], "limit": 1},
+        )
+        if recs and isinstance(recs, list) and recs[0].get("default_code"):
+            return recs[0]["default_code"]
+        return None
+
+    def read_all_product_tags_cached(self) -> Dict[int, str]:
+        """Lee todas las etiquetas de producto y retorna un mapa id->name; usa OdooProduct si está disponible."""
+        if self._tag_cache:
+            return {k: v for k, v in self._tag_cache.items() if v}
+        client = self.get_product_client()
+        tags = []
+        try:
+            if hasattr(client, "read_all_product_tags"):
+                df = client.read_all_product_tags()
+                try:
+                    tags = df.to_dict(orient="records")  # si viene DataFrame
+                except Exception:
+                    tags = df
+        except Exception:
+            pass
+        if not tags:
+            try:
+                tags = self._execute_kw(
+                    "product.tag",
+                    "search_read",
+                    [[]],
+                    {"fields": ["id", "name"]},
+                )
+            except Exception:
+                tags = []
+        for tag in tags or []:
+            tid = self._normalize_id(tag.get("id"))
+            tname = tag.get("name")
+            if tid:
+                self._tag_cache[tid] = tname
+        return {k: v for k, v in self._tag_cache.items() if v}
+
+    def get_active_skus(self) -> set[str]:
+        """Retorna SKUs activos usando helper de OdooProduct si existe; fallback a search_read."""
+        client = self.get_product_client()
+        try:
+            if hasattr(client, "get_active_skus"):
+                skus = client.get_active_skus()
+                return set(skus) if skus else set()
+        except Exception:
+            pass
+        try:
+            products = self._execute_kw(
+                "product.product",
+                "search_read",
+                [[["active", "=", True], ["default_code", "!=", False]]],
+                {"fields": ["default_code"]},
+            )
+            return {
+                prod["default_code"]
+                for prod in products
+                if isinstance(prod, dict) and prod.get("default_code")
+            }
+        except Exception:
+            return set()
+
+    def read_products_for_embeddings(self, domain: Optional[list] = None):
+        """Proxy a OdooProduct.read_products_for_embeddings si está disponible; caso contrario, devuelve None."""
+        client = self.get_product_client()
+        try:
+            if hasattr(client, "read_products_for_embeddings"):
+                return client.read_products_for_embeddings(domain=domain)
+        except Exception:
+            return None
+        return None
     def _get_supplierinfo_fields(self) -> Dict[str, dict]:
         if self._supplierinfo_fields is None:
             fields = self._execute_kw(
@@ -1045,13 +1247,194 @@ class OdooConnectionManager:
         )[0]
         return order
     
-    def confirm_order_receipt(self, order: dict) -> None:
-        """Confirma la recepcion de todos los pickings asociados a la orden"""
-        picking_ids = order.get("picking_ids", [])
+    def confirm_order_receipt(self, order: dict, qty_by_product: Dict[int, float] | None = None) -> None:
+        """Confirma la recepcion de pickings asociados a la orden, separando destinos según etiquetas."""
+        picking_ids = self._normalize_id_list(order.get("picking_ids", []))
         if not picking_ids:
             return
-        self._execute_kw("stock.picking", "action_confirm", [picking_ids])
-        self._execute_kw("stock.picking", "button_validate", [picking_ids])
+        dest_mp_me = self._get_location_id_by_name("JS/Stock/Materia prima y Envases")
+        dest_pt = self._get_location_id_by_name("JS/Stock")
+        qty_by_product = qty_by_product or {}
+
+        def _tag_names(tag_ids: List[int]) -> set[str]:
+            names: set[str] = set()
+            missing: List[int] = []
+            for tid in tag_ids or []:
+                if tid in self._tag_cache:
+                    if self._tag_cache[tid]:
+                        names.add(self._tag_cache[tid])
+                else:
+                    missing.append(tid)
+            if missing:
+                try:
+                    records = self._execute_kw(
+                        "product.tag",
+                        "read",
+                        [missing],
+                        {"fields": ["name"]},
+                    )
+                    for rec in records:
+                        tid = self._normalize_id(rec.get("id"))
+                        tname = rec.get("name")
+                        self._tag_cache[tid] = tname
+                        if tname:
+                            names.add(tname)
+                except Exception as exc:
+                    logger.warning("No se pudieron leer etiquetas %s: %s", missing, exc)
+            return names
+
+        def _target_location(prod_id: Optional[int], tag_ids: List[int]) -> Optional[int]:
+            tag_names = _tag_names(tag_ids)
+            if {"MP", "ME"} & tag_names:
+                return dest_mp_me
+            if "PT" in tag_names:
+                return dest_pt
+            return None
+
+        # Detectar si quantity_done existe en stock.move
+        has_move_qty_done: bool = False
+        try:
+            move_fields = self._execute_kw("stock.move", "fields_get", [], {"attributes": ["type"]})
+            has_move_qty_done = "quantity_done" in move_fields
+        except Exception:
+            has_move_qty_done = False
+
+        order_lines = self.read_order_lines(order.get("order_line", []))
+
+        pickings = self._execute_kw(
+            "stock.picking",
+            "read",
+            [picking_ids],
+            {"fields": ["id", "state", "move_ids_without_package"]},
+        )
+
+        # Cache de tags de productos si está disponible
+        product_ids_all: List[int] = []
+        for line in order_lines:
+            pid = line.get("product_id")
+            if pid:
+                product_ids_all.append(pid)
+        tag_by_product_full = self._product_tags_for_ids(product_ids_all)
+
+        for picking in pickings:
+            # Confirmar picking si es necesario y el método existe
+            try:
+                self._execute_kw("stock.picking", "action_confirm", [[picking.get("id")]])
+            except Exception:
+                pass
+            move_ids = self._normalize_id_list(picking.get("move_ids_without_package", []))
+            if not move_ids:
+                continue
+            moves = self._execute_kw(
+                "stock.move",
+                "read",
+                [move_ids],
+                {"fields": ["id", "product_id", "location_id", "location_dest_id", "product_uom_qty", "move_line_ids"]},
+            )
+            groups: Dict[Optional[int], List[dict]] = {}
+            for move in moves:
+                prod_id = move.get("product_id", [None])[0] if move.get("product_id") else None
+                tags = tag_by_product_full.get(self._normalize_id(prod_id), [])
+                target_loc = _target_location(prod_id, tags)
+                groups.setdefault(target_loc, []).append(move)
+
+            for target_loc, move_group in groups.items():
+                if not move_group:
+                    continue
+                move_ids_group = [mv["id"] for mv in move_group if mv.get("id")]
+                move_line_ids: List[int] = []
+                for mv in move_group:
+                    move_line_ids.extend(self._normalize_id_list(mv.get("move_line_ids", [])))
+
+                # Si no hay ubicación destino para el grupo, registrar seguimiento y no cambiar destino.
+                if target_loc is None:
+                    logger.warning("No se pudo resolver ubicación destino para moves %s; se requiere intervención manual.", move_ids_group)
+
+                # Actualizar destino en moves y move lines si aplica.
+                if target_loc:
+                    try:
+                        self._execute_kw(
+                            "stock.move",
+                            "write",
+                            [move_ids_group, {"location_dest_id": target_loc}],
+                        )
+                    except Exception as exc:
+                        logger.warning("No se pudo actualizar destino de recepción para moves %s: %s", move_ids_group, exc)
+                    if move_line_ids:
+                        try:
+                            self._execute_kw(
+                                "stock.move.line",
+                                "write",
+                                [move_line_ids, {"location_dest_id": target_loc}],
+                            )
+                        except Exception as exc:
+                            logger.warning("No se pudo actualizar destino en move lines %s: %s", move_line_ids, exc)
+
+                # Ajustar quantities a la cantidad de factura si está disponible; si no, usar planificada.
+                for mv in move_group:
+                    mv_id = mv.get("id")
+                    prod_raw = mv.get("product_id", [None])[0] if mv.get("product_id") else None
+                    pid = self._normalize_id(prod_raw)
+                    qty_planned = mv.get("product_uom_qty") or 0.0
+                    qty_invoice = qty_by_product.get(pid) if pid is not None else None
+                    qty_to_set = qty_invoice if qty_invoice is not None else qty_planned
+                    if has_move_qty_done and mv_id and qty_to_set:
+                        try:
+                            self._execute_kw(
+                                "stock.move",
+                                "write",
+                                [[mv_id], {"quantity_done": qty_to_set}],
+                            )
+                        except Exception as exc:
+                            logger.warning("No se pudo setear quantity_done para move %s: %s", mv_id, exc)
+                    # Ajustar/crear move lines con qty_done
+                    line_ids_mv = self._normalize_id_list(mv.get("move_line_ids", []))
+                    if line_ids_mv and qty_to_set:
+                        try:
+                            move_lines = self._execute_kw(
+                                "stock.move.line",
+                                "read",
+                                [line_ids_mv],
+                                {"fields": ["id", "qty_done"]},
+                            )
+                            for ml in move_lines:
+                                if not ml.get("id"):
+                                    continue
+                                try:
+                                    self._execute_kw(
+                                        "stock.move.line",
+                                        "write",
+                                        [[ml["id"]], {"qty_done": qty_to_set}],
+                                    )
+                                except Exception as exc:
+                                    logger.warning("No se pudo setear qty_done para move line %s: %s", ml["id"], exc)
+                        except Exception as exc:
+                            logger.warning("No se pudieron leer move lines %s: %s", line_ids_mv, exc)
+                    if (not line_ids_mv) and qty_to_set and mv_id:
+                        try:
+                            src_loc = self._normalize_id(mv.get("location_id"))
+                            dest_loc_line = target_loc if target_loc else self._normalize_id(mv.get("location_dest_id"))
+                            self._execute_kw(
+                                "stock.move.line",
+                                "create",
+                                [[
+                                    {
+                                        "move_id": mv_id,
+                                        "product_id": pid,
+                                        "qty_done": qty_to_set,
+                                        "location_id": src_loc,
+                                        "location_dest_id": dest_loc_line,
+                                    }
+                                ]],
+                            )
+                        except Exception as exc:
+                            logger.warning("No se pudo crear move line para move %s: %s", mv_id, exc)
+
+                try:
+                    # Validar siempre el picking para asegurar qty_done en move lines
+                    self._execute_kw("stock.picking", "button_validate", [[picking.get("id")]])
+                except Exception as exc:
+                    logger.warning("No se pudo validar moves %s: %s", move_ids_group, exc)
     
     def create_invoice_for_order(self, order_id: int) -> None:
         """Genera la factura desde la orden de compra."""
