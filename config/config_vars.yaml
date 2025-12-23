@@ -20,6 +20,11 @@ variables:
     type: str
     default: "gpt-4o-mini"
 
+  EMBEDDING_MODEL:
+    source: EMBEDDING_MODEL
+    type: str
+    default: "text-embedding-3-small"
+
   DEFAULT_PURCHASE_TAX_IDS:
     source: DEFAULT_PURCHASE_TAX_IDS
     type: str
@@ -61,7 +66,7 @@ variables:
   DATA_PATH:
     source: DATA_PATH
     type: str
-    default: /Users/bastianibanez/work/invoice-processor/data
+    default: ./data
 
 validation:
   required:

@@ -213,4 +213,4 @@ todos.txt
 # Github-pusher
 github-pusher-key.json
 
-test/*.md
+tests/*.md

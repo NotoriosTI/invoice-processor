@@ -2,10 +2,12 @@ import logging
 import re
 import unicodedata
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 from odoo_api import OdooProduct, OdooWarehouse, OdooSupply
 from datetime import datetime
 from ...config import get_settings
+from .embedding_service import EmbeddingService, choose_best_match_with_fallback
 from rich.traceback import install
 
 install()
@@ -18,6 +20,53 @@ MIN_ORDER_SIMILARITY = 0.5
 MIN_PRODUCT_LINE_SIMILARITY = 0.6
 MIN_LINE_MATCH_RATIO = 0.6
 MAX_TOTAL_MISMATCH_RATIO = 0.05
+MIN_PRODUCT_EMBEDDING_SCORE = 0.7
+PRODUCT_EMBEDDING_CACHE_FILE = "product_embeddings.pkl"
+
+SYNONYM_MAP: Dict[str, str] = {
+    "cj": "caja",
+    "und": "unidad",
+    "un": "unidad",
+    "pza": "pieza",
+    "lt": "litro",
+    "gr": "gramo",
+}
+
+STOPWORDS: set[str] = {
+    "mp",
+    "aceite",
+    "aceites",
+    "esencial",
+    "esenciales",
+    "exfoliantes",
+    "semillas",
+    "harinas",
+    "producto",
+    "materia",
+    "prima",
+    "efervescentes",
+    "sales",
+    "sello",
+    "tapa",
+    "vidrio",
+    "transparente",
+    "pote",
+    "crema",
+    "blanca",
+    "mesh",
+    "saco",
+    "kg",
+    "g",
+    "gr",
+    "ml",
+    "l",
+    "lt",
+    "lote",
+    "vto",
+    "fv",
+    "neto",
+    "cod",
+}
 
 
 class OdooConnectionManager:
@@ -37,6 +86,7 @@ class OdooConnectionManager:
         if getattr(self, "_initialized", False):
             return
         settings = get_settings()
+        self._settings = settings
         self._connection_config = {
             "url": settings.odoo_url,
             "db": settings.odoo_db,
@@ -57,6 +107,11 @@ class OdooConnectionManager:
         self._location_cache: Dict[str, Optional[int]] = {}
         self._has_product_tag_field: Optional[bool] = None
         self._product_tag_by_product: Dict[int, List[int]] = {}
+        self._embedding_cache_path = settings.data_path / PRODUCT_EMBEDDING_CACHE_FILE
+        self._embedding_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self._embedding_service: Optional[EmbeddingService] = None
+        self._product_embeddings_cache: Optional[Dict[str, Any]] = None
+        self._product_embeddings_cache_by_supplier: Dict[int, Dict[str, Any]] = {}
 
     @staticmethod
     def _normalize_id(value: Any) -> Optional[int]:
@@ -180,6 +235,118 @@ class OdooConnectionManager:
             if best >= MIN_PRODUCT_LINE_SIMILARITY:
                 matched_lines += 1
         return total / max(len(invoice_details), 1), scores, matched_lines
+
+    def _get_embedding_service(self) -> EmbeddingService:
+        if self._embedding_service is None:
+            self._embedding_service = EmbeddingService(
+                model_name=getattr(self._settings, "embedding_model", "text-embedding-3-small"),
+                api_key=self._settings.openai_api_key,
+                cache_path=self._embedding_cache_path,
+            )
+        return self._embedding_service
+
+    def _embedding_cache_path_for_supplier(self, supplier_id: Optional[int]) -> Path:
+        if supplier_id is None:
+            return self._embedding_cache_path
+        return self._settings.data_path / f"product_embeddings_supplier_{supplier_id}.pkl"
+
+    def _refresh_product_embeddings(self, force: bool = False, supplier_id: Optional[int] = None) -> None:
+        """Genera o carga embeddings; si supplier_id está presente, usa caché filtrada por proveedor."""
+        service = self._get_embedding_service()
+        cache_path = self._embedding_cache_path_for_supplier(supplier_id)
+
+        target_cache = (
+            self._product_embeddings_cache_by_supplier.get(int(supplier_id))
+            if supplier_id is not None
+            else self._product_embeddings_cache
+        )
+
+        if target_cache and not force:
+            return
+
+        if not force:
+            cached = service.load_cache(cache_path)
+            if cached:
+                if supplier_id is None:
+                    self._product_embeddings_cache = cached
+                else:
+                    self._product_embeddings_cache_by_supplier[int(supplier_id)] = cached
+                return
+
+        domain = None
+        if supplier_id is not None:
+            domain = [["seller_ids.name", "=", int(supplier_id)]]
+
+        try:
+            df_products = self.read_products_for_embeddings(domain=domain)
+        except Exception as exc:
+            logger.warning("No se pudieron leer productos para embeddings: %s", exc)
+            return
+        if df_products is None:
+            logger.warning("read_products_for_embeddings devolvió None.")
+            return
+
+        try:
+            if hasattr(df_products, "__getitem__") and hasattr(df_products, "to_dict"):
+                texts = df_products["text_for_embedding"].fillna("").astype(str).tolist()
+                ids = [int(x) for x in df_products["id"].tolist()]
+            else:
+                texts = [str(item.get("text_for_embedding", "")) for item in df_products]
+                ids = [int(item.get("id")) for item in df_products if item.get("id") is not None]
+        except Exception as exc:
+            logger.warning("Formato inesperado en productos para embeddings: %s", exc)
+            return
+
+        if not ids or not texts or len(ids) != len(texts):
+            logger.warning("Productos para embeddings incompletos; ids=%s, textos=%s", len(ids), len(texts))
+            return
+
+        try:
+            vectors = service.embed_documents(texts)
+        except Exception as exc:
+            logger.warning("Error generando embeddings de productos: %s", exc)
+            return
+
+        service.save_cache(ids, vectors, path=cache_path)
+        payload = {"ids": ids, "vectors": vectors}
+        if supplier_id is None:
+            self._product_embeddings_cache = payload
+        else:
+            self._product_embeddings_cache_by_supplier[int(supplier_id)] = payload
+
+    def _find_product_candidate_by_embedding(self, invoice_line: "InvoiceLine", supplier_id: Optional[int] = None) -> Optional[int]:
+        detail = getattr(invoice_line, "detalle", None) or ""
+        if not detail.strip():
+            return None
+        try:
+            if supplier_id:
+                self._refresh_product_embeddings(force=False, supplier_id=supplier_id)
+            self._refresh_product_embeddings(force=False)
+        except Exception as exc:
+            logger.warning("No se pudo refrescar la caché de embeddings: %s", exc)
+            return None
+
+        caches = []
+        if supplier_id:
+            caches.append(self._product_embeddings_cache_by_supplier.get(int(supplier_id)))
+        caches.append(self._product_embeddings_cache)
+
+        try:
+            match = choose_best_match_with_fallback(
+                self._get_embedding_service(),
+                detail,
+                caches,
+                MIN_PRODUCT_EMBEDDING_SCORE,
+            )
+        except Exception as exc:
+            logger.warning("No se pudo realizar la búsqueda por embeddings: %s", exc)
+            return None
+
+        if not match:
+            return None
+        product_id, score = match
+        logger.info("Producto detectado por embeddings: ID %s (score %.2f)", product_id, score)
+        return product_id
 
     def _execute_kw(self, model, method, args=None, kwargs=None):
         """Atajo para llamar XML-RPC usando el product_client actual.
@@ -746,7 +913,7 @@ class OdooConnectionManager:
             return "product_id"
         raise RuntimeError("No hay un campo para asociar el producto en product.supplierinfo.")
 
-    def _find_product_candidate(self, invoice_line: "InvoiceLine") -> Optional[int]:
+    def _find_product_candidate(self, invoice_line: "InvoiceLine", supplier_id: Optional[int] = None) -> Optional[int]:
         def _normalize(text: str) -> str:
             if not text:
                 return ""
@@ -762,41 +929,14 @@ class OdooConnectionManager:
             return text
 
         def _tokens(text: str) -> List[str]:
-            stopwords = {
-                "mp",
-                "aceite",
-                "aceites",
-                "esencial",
-                "esenciales",
-                "exfoliantes",
-                "semillas",
-                "harinas",
-                "producto",
-                "materia",
-                "prima",
-                "efervescentes",
-                "sales",
-                "sello",
-                "tapa",
-                "vidrio",
-                "transparente",
-                "pote",
-                "crema",
-                "blanca",
-                "mesh",
-                "saco",
-                "kg",
-                "g",
-                "gr",
-                "ml",
-                "l",
-                "lt",
-            }
-            parts = [_normalize(text)]
-            if parts and parts[0]:
-                words = [w for w in parts[0].split() if w and w not in stopwords]
-            else:
-                words = []
+            normalized = _normalize(text)
+            if not normalized:
+                return []
+            words: List[str] = []
+            for word in normalized.split():
+                if not word or word in STOPWORDS:
+                    continue
+                words.append(SYNONYM_MAP.get(word, word))
             return words
 
         def _extract_quantity(text: str) -> Optional[Tuple[float, str]]:
@@ -865,6 +1005,10 @@ class OdooConnectionManager:
                 unit_bonus = 0.1
             return base * 0.2 + token_score * 0.6 + qty_bonus + unit_bonus
 
+        embedding_candidate = self._find_product_candidate_by_embedding(invoice_line, supplier_id=supplier_id)
+        if embedding_candidate:
+            return embedding_candidate
+
         detail = invoice_line.detalle if hasattr(invoice_line, "detalle") else ""
         target_norm = _normalize(detail)
         target_tokens = _tokens(detail)
@@ -878,20 +1022,29 @@ class OdooConnectionManager:
                 if len(tok) >= 3:
                     search_terms.add(tok)
 
-        product_ids: set[int] = set()
-        for term in search_terms:
+        def _search_product_ids(term: str, domain_supplier: bool) -> List[int]:
             if not term:
-                continue
+                return []
+            domain = [["name", "ilike", term]]
+            if domain_supplier and supplier_id:
+                domain.append(["seller_ids.name", "=", int(supplier_id)])
             try:
-                ids = self._execute_kw(
+                return self._execute_kw(
                     "product.product",
                     "search",
-                    [[["name", "ilike", term]]],
+                    [domain],
                     {"limit": 10},
                 )
-                product_ids.update(ids)
             except Exception:
-                continue
+                return []
+
+        product_ids: set[int] = set()
+        for term in search_terms:
+            product_ids.update(_search_product_ids(term, domain_supplier=True))
+
+        if not product_ids and supplier_id:
+            for term in search_terms:
+                product_ids.update(_search_product_ids(term, domain_supplier=False))
 
         if not product_ids:
             return None
@@ -1022,7 +1175,7 @@ class OdooConnectionManager:
 
     def ensure_product_for_supplier(self, invoice_line: "InvoiceLine", supplier_id: int) -> int:
         """Garantiza que exista un product_id compatible con el proveedor."""
-        product_id = self._find_product_candidate(invoice_line)
+        product_id = self._find_product_candidate(invoice_line, supplier_id=supplier_id)
         if product_id:
             self._ensure_supplier_on_product(product_id, supplier_id, invoice_line.precio_unitario)
             return product_id
