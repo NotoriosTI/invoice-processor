@@ -2,4 +2,19 @@ slack_access:
   enable: true
   users:
     - id: U0A172UPR1B
-      name: tomás
+      name: Tomás Núñez
+
+    - id: U054E2KDB33
+      name: Vannessa Mioranza
+
+    - id: U06BV3Y8F8F
+      name: Jose Luis Moustro
+
+    - id: U05DR319TCH
+      name: Solange
+
+    - id: U050PD2G4DV
+      name: Samuel Parada
+
+    - id: U0916AJDY9Z
+      name: Bastian Ibañez

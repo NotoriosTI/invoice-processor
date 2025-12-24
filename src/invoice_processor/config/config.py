@@ -3,6 +3,8 @@ from env_manager import init_config, require_config, get_config
 from pathlib import Path
 import yaml
 import os
+import logging
+from typing import Dict, List, Any
 
 PROJECT_ROOT = Path().cwd()
 CONFIG_PATH = PROJECT_ROOT / "config/config_vars.yaml"
@@ -67,14 +69,33 @@ def load_allowed_users():
     settings = get_settings()
     path = Path(settings.allowed_users_file)
     if not path.exists():
+        logging.warning("Archivo de usuarios permitidos no encontrado: %s", path)
         return {"enabled": False, "users": []}
     data = yaml.safe_load(path.read_text()) or {}
     slack_access = data.get("slack_access", {})
     enabled_flag = slack_access.get("enabled", slack_access.get("enable", False))
+    users_raw = slack_access.get("users", [])
+    users: List[Dict[str, str]] = []
+    for entry in users_raw or []:
+        if not isinstance(entry, dict):
+            logging.warning("Entrada de usuario inválida (no es dict), se ignora: %s", entry)
+            continue
+        uid = entry.get("id")
+        name = entry.get("name", "")
+        if not uid or not isinstance(uid, str):
+            logging.warning("Entrada de usuario sin id válido, se ignora: %s", entry)
+            continue
+        users.append({"id": uid, "name": str(name)})
     return {
         "enabled": bool(enabled_flag),
-        "users": slack_access.get("users", []),
+        "users": users,
     }
+
+def is_user_allowed(user_id: str) -> bool:
+    info = load_allowed_users()
+    if not info.get("enabled"):
+        return False
+    return any(user_id == u.get("id") for u in info.get("users", []))
 
 def get_settings() -> Settings:
     return Settings()
