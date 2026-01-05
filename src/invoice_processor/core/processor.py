@@ -351,6 +351,43 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
 
     if not invoice.lines:
         raise ValueError("La factura no contiene líneas de productos para comparar.")
+
+    resolved_supplier_id = odoo_manager._resolve_supplier_id(None, invoice.supplier_name)
+    pending_products: List[ProcessedProduct] = []
+    for line in invoice.lines:
+        candidates = odoo_manager.get_product_candidates(
+            line.detalle,
+            supplier_id=resolved_supplier_id,
+            supplier_name=invoice.supplier_name,
+            invoice_line=line,
+        )
+        pending_products.append(
+            ProcessedProduct(
+                detalle=line.detalle,
+                cantidad_match=False,
+                precio_match=False,
+                subtotal_match=False,
+                issues="Confirma el producto correcto antes de continuar.",
+                status="AMBIGUOUS",
+                candidates=candidates,
+            )
+        )
+
+    if pending_products:
+        summary_msg = "Flujo detenido: se requieren decisiones humanas para mapear productos antes de continuar."
+        if ocr_warning:
+            summary_msg = f"{summary_msg} {ocr_warning}"
+        return InvoiceResponseModel(
+            summary=summary_msg,
+            products=pending_products,
+            needs_follow_up=True,
+            neto_match=None,
+            iva_match=None,
+            total_match=None,
+            supplier_id=resolved_supplier_id,
+            status="WAITING_FOR_HUMAN",
+        )
+
     try:
         order = _load_purchase_order(invoice)
     except Exception as exc:
@@ -427,6 +464,8 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                 extra = f"Recepción: factura {line.cantidad} vs recibido {qty_received}."
                 product_result.issues = f"{product_result.issues or ''} {extra}".strip()
 
+        if not product_result.issues:
+            product_result = product_result.model_copy(update={"status": "MATCHED"})
         products.append(product_result)
 
     odoo_manager.recompute_order_amounts(order["id"])

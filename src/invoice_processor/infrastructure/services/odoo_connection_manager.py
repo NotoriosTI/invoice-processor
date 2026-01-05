@@ -1,8 +1,11 @@
+from __future__ import annotations
 import logging
+import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 from odoo_api import OdooProduct, OdooWarehouse, OdooSupply
 from datetime import datetime
@@ -22,6 +25,8 @@ MIN_LINE_MATCH_RATIO = 0.6
 MAX_TOTAL_MISMATCH_RATIO = 0.05
 MIN_PRODUCT_EMBEDDING_SCORE = 0.7
 PRODUCT_EMBEDDING_CACHE_FILE = "product_embeddings.pkl"
+MIN_PRODUCT_CONFIDENCE = 0.9
+MAX_PRODUCT_CANDIDATES = 5
 
 SYNONYM_MAP: Dict[str, str] = {
     "cj": "caja",
@@ -409,7 +414,8 @@ class OdooConnectionManager:
         invoice_line: "InvoiceLine",
         supplier_id: Optional[int] = None,
         supplier_name: Optional[str] = None,
-    ) -> Optional[int]:
+        return_score: bool = False,
+    ):
         detail = getattr(invoice_line, "detalle", None) or ""
         if not detail.strip():
             return None
@@ -442,6 +448,8 @@ class OdooConnectionManager:
             return None
         product_id, score = match
         logger.info("Producto detectado por embeddings: ID %s (score %.2f)", product_id, score)
+        if return_score:
+            return product_id, score
         return product_id
 
     def _execute_kw(self, model, method, args=None, kwargs=None):
@@ -1130,13 +1138,14 @@ class OdooConnectionManager:
         def _search_product_ids(term: str, domain_supplier: bool) -> List[int]:
             if not term:
                 return []
-            domain = [["name", "ilike", term]]
+            base = ["|", ["name", "ilike", term], ["default_code", "ilike", term]]
+            domain = base
             if domain_supplier:
                 resolved_supplier_id = self._resolve_supplier_id(supplier_id, supplier_name)
                 if resolved_supplier_id:
-                    domain.append(["seller_ids.partner_id", "=", int(resolved_supplier_id)])
+                    domain = ["&", ["seller_ids.partner_id", "=", int(resolved_supplier_id)], base]
                 elif supplier_name:
-                    domain.append(["seller_ids.name", "ilike", supplier_name])
+                    domain = ["&", ["seller_ids.name", "ilike", supplier_name], base]
             try:
                 return self._execute_kw(
                     "product.product",
@@ -1166,7 +1175,6 @@ class OdooConnectionManager:
         )
         if not products:
             return None
-
         best_product = None
         best_score = 0.0
         best_token_score = 0.0
@@ -1197,6 +1205,286 @@ class OdooConnectionManager:
             )
             return best_product.get("id")
         return None
+
+    def get_product_candidates(
+        self,
+        description: str,
+        supplier_id: Optional[int] = None,
+        supplier_name: Optional[str] = None,
+        invoice_line: "InvoiceLine" | None = None,
+        limit: int = MAX_PRODUCT_CANDIDATES,
+    ) -> List[Dict[str, Any]]:
+        """Retorna candidatos de producto con score usando embeddings y fuzzy search."""
+        detail = (description or "").strip()
+        if not detail:
+            return []
+
+        def _normalize(text: str) -> str:
+            if not text:
+                return ""
+            text = text.lower()
+            text = re.sub(r"\[[^\]]+\]", " ", text)
+            text = "".join(
+                ch
+                for ch in unicodedata.normalize("NFD", text)
+                if unicodedata.category(ch) != "Mn"
+            )
+            text = re.sub(r"[^a-z0-9\s]", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text
+
+        def _tokens(text: str) -> List[str]:
+            normalized = _normalize(text)
+            if not normalized:
+                return []
+            words: List[str] = []
+            for word in normalized.split():
+                if not word or word in STOPWORDS:
+                    continue
+                words.append(SYNONYM_MAP.get(word, word))
+            return words
+
+        def _extract_quantity(text: str) -> Optional[Tuple[float, str]]:
+            pattern = re.compile(r"(\d+(?:[\.,]\d+)?)\s*(kg|g|gr|gramos?|ml|l|lt|cc)", re.IGNORECASE)
+            match = pattern.search(text or "")
+            if not match:
+                return None
+            raw_val = match.group(1).replace(",", ".")
+            try:
+                val = float(raw_val)
+            except ValueError:
+                return None
+            unit = match.group(2).lower()
+            if unit in {"kg"}:
+                return val * 1000.0, "g"
+            if unit in {"l", "lt"}:
+                return val * 1000.0, "ml"
+            if unit == "cc":
+                return val, "cc"
+            return val, unit
+
+        def _normalize_unit(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return None
+            unit = value.strip().lower()
+            mapping = {
+                "kg": {"kg", "kilo", "kilos"},
+                "g": {"g", "gr", "gramo", "gramos"},
+                "l": {"l", "lt", "litro", "litros"},
+                "ml": {"ml", "mililitro", "mililitros"},
+                "unidad": {"unidad", "unidades", "ud", "uds", "un"},
+                "saco": {"saco", "sacos"},
+                "caja": {"caja", "cajas"},
+            }
+            for norm, variants in mapping.items():
+                if unit in variants:
+                    return norm
+            return unit
+
+        def _score_candidate(
+            target_norm: str,
+            cand_norm: str,
+            target_tokens: List[str],
+            cand_tokens: List[str],
+            target_qty,
+            cand_qty,
+            target_unit: Optional[str],
+        ) -> float:
+            base = SequenceMatcher(None, target_norm, cand_norm).ratio()
+            if target_tokens:
+                overlap = len(set(target_tokens) & set(cand_tokens))
+                token_score = overlap / max(len(target_tokens), 1)
+            else:
+                token_score = 0.0
+            qty_bonus = 0.0
+            if target_qty and cand_qty:
+                t_val, t_unit = target_qty
+                c_val, c_unit = cand_qty
+                if t_unit == c_unit and t_val > 0:
+                    diff = abs(t_val - c_val) / t_val
+                    if diff <= 0.1:
+                        qty_bonus = 0.1
+            unit_bonus = 0.0
+            cand_unit = cand_qty[1] if cand_qty else None
+            if target_unit and cand_unit and target_unit == cand_unit:
+                unit_bonus = 0.1
+            return base * 0.2 + token_score * 0.6 + qty_bonus + unit_bonus
+
+        def _search_product_ids(term: str, domain_supplier: bool) -> List[int]:
+            if not term:
+                return []
+            domain = [["name", "ilike", term]]
+            if domain_supplier:
+                resolved_supplier_id = self._resolve_supplier_id(supplier_id, supplier_name)
+                if resolved_supplier_id:
+                    domain.append(["seller_ids.partner_id", "=", int(resolved_supplier_id)])
+                elif supplier_name:
+                    domain.append(["seller_ids.name", "ilike", supplier_name])
+            try:
+                return self._execute_kw(
+                    "product.product",
+                    "search",
+                    [domain],
+                    {"limit": 10},
+                )
+            except Exception:
+                return []
+
+        unidad = getattr(invoice_line, "unidad", None) if invoice_line is not None else None
+        target_norm = _normalize(detail)
+        target_tokens = _tokens(detail)
+        target_qty = _extract_quantity(detail)
+        target_unit = _normalize_unit(unidad)
+
+        search_terms = {detail}
+        if target_tokens:
+            search_terms.add(" ".join(target_tokens[:2]))
+            for tok in target_tokens:
+                if len(tok) >= 3:
+                    search_terms.add(tok)
+
+        product_ids: set[int] = set()
+        # 1) Intento filtrado por proveedor: si hay supplier_id/nombre, priorizar productos del proveedor.
+        for term in search_terms:
+            product_ids.update(_search_product_ids(term, domain_supplier=True))
+        # 2) Fallback global: si no hay resultados con proveedor, buscar global para ofrecer candidatos al usuario.
+        if not product_ids:
+            for term in search_terms:
+                product_ids.update(_search_product_ids(term, domain_supplier=False))
+
+        candidates: List[Dict[str, Any]] = []
+
+        line_for_embedding = invoice_line or SimpleNamespace(detalle=detail, unidad=unidad)
+        try:
+            embedding_match = self._find_product_candidate_by_embedding(
+                line_for_embedding,
+                supplier_id=supplier_id,
+                supplier_name=supplier_name,
+                return_score=True,
+            )
+        except Exception as exc:
+            logger.warning("Búsqueda por embedding falló: %s", exc)
+            embedding_match = None
+
+        if embedding_match:
+            emb_id, emb_score = embedding_match
+            emb_norm = self._normalize_id(emb_id)
+            if emb_norm is not None:
+                product_ids.add(emb_norm)
+                candidates.append({"id": emb_norm, "score": float(emb_score)})
+
+        product_records = []
+        if product_ids:
+            try:
+                product_records = self._execute_kw(
+                    "product.product",
+                    "read",
+                    [self._normalize_id_list(list(product_ids))],
+                    {"fields": ["id", "name", "default_code", "product_tag_ids", "seller_ids", "purchase_ok", "sale_ok", "categ_id"]},
+                )
+            except Exception as exc:
+                logger.warning("No se pudieron leer productos para candidatos: %s", exc)
+                product_records = []
+
+        tag_names_by_product: Dict[int, set[str]] = {}
+        supplier_id_norm = self._normalize_id(supplier_id) if supplier_id is not None else None
+
+        product_by_id: Dict[int, Dict[str, Any]] = {}
+
+        if product_records:
+            pid_list = [self._normalize_id(prod.get("id")) for prod in product_records if prod.get("id") is not None]
+            tag_by_pid = self._product_tags_for_ids([pid for pid in pid_list if pid is not None])
+            # Completar nombres de tags faltantes desde product.tag
+            missing_tag_ids: set[int] = set()
+            for tags_ids in (tag_by_pid or {}).values():
+                for tid in tags_ids or []:
+                    if tid not in self._tag_cache:
+                        missing_tag_ids.add(tid)
+            if missing_tag_ids:
+                try:
+                    tag_records = self._execute_kw(
+                        "product.tag",
+                        "read",
+                        [list(missing_tag_ids)],
+                        {"fields": ["id", "name"]},
+                    )
+                    for rec in tag_records or []:
+                        tid = self._normalize_id(rec.get("id"))
+                        tname = rec.get("name")
+                        if tid is not None and tname:
+                            self._tag_cache[tid] = tname
+                except Exception as exc:
+                    logger.debug("No se pudieron leer nombres de tags faltantes: %s", exc)
+            for pid, tag_ids in (tag_by_pid or {}).items():
+                names: set[str] = set()
+                for tid in tag_ids or []:
+                    tname = self._tag_cache.get(tid)
+                    if tname:
+                        names.add(tname)
+                tag_names_by_product[pid] = names
+            for prod in product_records or []:
+                pid = self._normalize_id(prod.get("id"))
+                if pid is not None:
+                    product_by_id[pid] = prod
+
+        for prod in product_records or []:
+            cand_name = prod.get("name") or ""
+            cand_norm = _normalize(cand_name)
+            cand_tokens = _tokens(cand_name)
+            cand_qty = _extract_quantity(cand_name)
+            score = _score_candidate(target_norm, cand_norm, target_tokens, cand_tokens, target_qty, cand_qty, target_unit)
+
+            supplier_bonus = 0.0
+            seller_ids = self._normalize_id_list(prod.get("seller_ids") or [])
+            if supplier_id_norm is not None:
+                if supplier_id_norm in seller_ids:
+                    supplier_bonus = 0.5
+                elif seller_ids:
+                    supplier_bonus = -0.2
+                else:
+                    supplier_bonus = -0.5
+            elif seller_ids:
+                supplier_bonus = 0.1
+
+            # Refuerzo: si hay proveedor esperado y el producto NO tiene seller_ids de nadie, penalización extra
+            if supplier_id_norm is not None and not seller_ids:
+                supplier_bonus -= 0.2
+
+            purchase_bonus = 0.1 if prod.get("purchase_ok") else -0.25
+            sale_penalty = -0.5 if (prod.get("sale_ok") and not prod.get("purchase_ok")) else 0.0
+
+            final_score = score + supplier_bonus + purchase_bonus + sale_penalty
+            dc = prod.get("default_code")
+            dc = dc if dc not in (False, None, "") else None
+            candidates.append(
+                {
+                    "id": prod.get("id"),
+                    "name": cand_name,
+                    "score": float(final_score),
+                    "default_code": dc,
+                }
+            )
+
+        best_by_id: Dict[int, Dict[str, Any]] = {}
+        for cand in candidates:
+            pid = self._normalize_id(cand.get("id"))
+            if pid is None:
+                continue
+            existing = best_by_id.get(pid)
+            cand_score = float(cand.get("score") or 0.0)
+            payload = {
+                "id": pid,
+                "name": cand.get("name") or (product_by_id.get(pid, {}).get("name") if product_by_id else None),
+                "default_code": cand.get("default_code") or (product_by_id.get(pid, {}).get("default_code") if product_by_id else None),
+                "score": round(cand_score, 3),
+            }
+            if not existing or cand_score > existing.get("score", 0.0):
+                best_by_id[pid] = payload
+
+        sorted_candidates = sorted(best_by_id.values(), key=lambda x: x.get("score", 0.0), reverse=True)
+        if limit and limit > 0:
+            return sorted_candidates[:limit]
+        return sorted_candidates
 
     def _ensure_supplier_on_product(self, product_id: int, supplier_id: int, price: float) -> None:
         product = self._execute_kw(
@@ -1232,6 +1520,7 @@ class OdooConnectionManager:
         product_id: int,
         supplier_id: int,
         price: float,
+        product_name: Optional[str] = None,
     ) -> None:
         fields = self._get_supplierinfo_fields()
         partner_field = self._supplierinfo_partner_field()
@@ -1261,6 +1550,8 @@ class OdooConnectionManager:
 
         if "delay" in fields and "delay" not in values:
             values["delay"] = 1
+        if product_name and "product_name" in fields:
+            values["product_name"] = product_name
 
         if "company_id" in fields and fields["company_id"].get("required"):
             partner = self._execute_kw(
@@ -1281,19 +1572,140 @@ class OdooConnectionManager:
             partner_field,
             product_field,
         )
+        if product_name:
+            logger.info("Nombre de factura mapeado a supplierinfo: %s", product_name)
 
-    def ensure_product_for_supplier(self, invoice_line: "InvoiceLine", supplier_id: int) -> int:
-        """Garantiza que exista un product_id compatible con el proveedor."""
-        product_id = self._find_product_candidate(
-            invoice_line,
-            supplier_id=supplier_id,
-            supplier_name=getattr(invoice_line, "supplier_name", None),
-        )
+    def _product_id_from_supplierinfo_record(self, record: dict) -> Optional[int]:
+        """Extrae product_id desde un registro de supplierinfo, resolviendo plantillas si aplica."""
+        product_field = self._supplierinfo_product_field()
+        product_ref = record.get(product_field)
+        prod_id = self._normalize_id(product_ref)
+        if prod_id is None:
+            return None
+        if product_field == "product_tmpl_id":
+            try:
+                prod_ids = self._execute_kw(
+                    "product.product",
+                    "search",
+                    [[["product_tmpl_id", "=", prod_id]]],
+                    {"limit": 1},
+                )
+                return self._normalize_id(prod_ids[0]) if prod_ids else None
+            except Exception:
+                return None
+        return prod_id
+
+    def get_mapped_product_id(self, invoice_detail: str, supplier_id: Optional[int], partial: bool = False) -> Optional[int]:
+        """Devuelve product_id mapeado por supplierinfo.product_name e ID de proveedor."""
+        if not invoice_detail or supplier_id is None:
+            return None
+        fields = self._get_supplierinfo_fields()
+        if "product_name" not in fields:
+            return None
+        partner_field = self._supplierinfo_partner_field()
+        op = "ilike" if partial else "="
+        domain = [
+            [partner_field, "=", self._normalize_id(supplier_id)],
+            ["product_name", op, invoice_detail],
+        ]
+        try:
+            records = self._execute_kw(
+                "product.supplierinfo",
+                "search_read",
+                [domain],
+                {"fields": ["id", partner_field, "product_name", self._supplierinfo_product_field()]},
+            )
+        except Exception as exc:
+            logger.warning("No se pudo leer supplierinfo para mapeo '%s': %s", invoice_detail, exc)
+            return None
+        if not records:
+            return None
+        product_id = self._product_id_from_supplierinfo_record(records[0])
         if product_id:
-            self._ensure_supplier_on_product(product_id, supplier_id, invoice_line.precio_unitario)
-            return product_id
+            logger.info("Producto obtenido desde mapeo supplierinfo: %s -> product_id %s", invoice_detail, product_id)
+        return product_id
 
-        logger.info("Creando producto nuevo para %s", invoice_line.detalle)
+    def ensure_product_for_supplier(
+        self,
+        invoice_line: "InvoiceLine",
+        supplier_id: Optional[int],
+        auto_create: bool = False,
+        supplier_name: Optional[str] = None,
+    ) -> Optional[int]:
+        """Garantiza que exista un product_id compatible con el proveedor."""
+        supplier_label = supplier_name or getattr(invoice_line, "supplier_name", None)
+        supplier_id_norm = self._normalize_id(supplier_id) if supplier_id is not None else None
+        force_hitl = str(os.getenv("FORCE_HITL", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+        def _product_has_supplier(pid: int) -> bool:
+            if supplier_id_norm is None:
+                return True
+            try:
+                recs = self._execute_kw(
+                    "product.product",
+                    "read",
+                    [[pid]],
+                    {"fields": ["seller_ids"]},
+                )
+                sellers = self._normalize_id_list(recs[0].get("seller_ids") or []) if recs else []
+                return supplier_id_norm in sellers
+            except Exception:
+                return False
+        # 1) Mapeo directo por SKU si viene en la línea
+        sku = getattr(invoice_line, "sku", None) or getattr(invoice_line, "default_code", None)
+        if sku:
+            pid_by_sku = self.get_product_id_by_sku(str(sku))
+            if pid_by_sku is not None:
+                if _product_has_supplier(pid_by_sku):
+                    if supplier_id is not None:
+                        self._ensure_supplier_on_product(pid_by_sku, supplier_id, invoice_line.precio_unitario)
+                    if not force_hitl:
+                        return pid_by_sku
+                # Si FORCE_HITL está activo y no hay seller válido, seguir a candidatos.
+
+        # 2) Mapeo directo por supplierinfo.product_name
+        mapped_id = self.get_mapped_product_id(getattr(invoice_line, "detalle", None), supplier_id)
+        if mapped_id is not None:
+            if _product_has_supplier(mapped_id):
+                if supplier_id is not None:
+                    self._ensure_supplier_on_product(mapped_id, supplier_id, invoice_line.precio_unitario)
+                if not force_hitl:
+                    return mapped_id
+        # 2b) Coincidencia parcial en supplierinfo si hay proveedor
+        mapped_partial = self.get_mapped_product_id(getattr(invoice_line, "detalle", None), supplier_id, partial=True)
+        if mapped_partial is not None:
+            if _product_has_supplier(mapped_partial):
+                if supplier_id is not None:
+                    self._ensure_supplier_on_product(mapped_partial, supplier_id, invoice_line.precio_unitario)
+                if not force_hitl:
+                    return mapped_partial
+
+        candidates = self.get_product_candidates(
+            getattr(invoice_line, "detalle", None),
+            supplier_id=supplier_id,
+            supplier_name=supplier_label,
+            invoice_line=invoice_line,
+        )
+
+        if candidates:
+            best = candidates[0]
+            best_score = float(best.get("score") or 0.0)
+            product_id = self._normalize_id(best.get("id"))
+            if product_id is not None and (
+                best_score >= MIN_PRODUCT_CONFIDENCE
+                or (auto_create and best_score >= MIN_PRODUCT_EMBEDDING_SCORE)
+            ):
+                if supplier_id is not None:
+                    self._ensure_supplier_on_product(product_id, supplier_id, invoice_line.precio_unitario)
+                return product_id
+
+        if not auto_create:
+            return None
+        if supplier_id is None:
+            logger.warning("No se puede crear producto sin supplier_id al forzar auto_create.")
+            return None
+
+        logger.info("Creando producto nuevo para %s", getattr(invoice_line, "detalle", "producto desconocido"))
         uom_id = self._get_default_uom_id()
         category_id = self._get_default_category_id()
         product_id = self._execute_kw(
@@ -1301,7 +1713,7 @@ class OdooConnectionManager:
             "create",
             [[
                 {
-                    "name": invoice_line.detalle,
+                    "name": getattr(invoice_line, "detalle", "Producto sin nombre"),
                     "type": "product",
                     "purchase_ok": True,
                     "sale_ok": False,
@@ -1313,6 +1725,85 @@ class OdooConnectionManager:
         )
         self._ensure_supplier_on_product(product_id, supplier_id, invoice_line.precio_unitario)
         return product_id
+
+
+    def _resolve_product_by_default_code(self, default_code: str, supplier_id: Optional[int] = None) -> Optional[int]:
+        """Busca product_id por default_code, opcionalmente filtrando por supplier_id."""
+        if not default_code:
+            return None
+        domain: list = [["default_code", "=", default_code]]
+        if supplier_id is not None:
+            domain = ["&", ["seller_ids.partner_id", "=", int(supplier_id)], domain]
+        try:
+            ids = self._execute_kw(
+                "product.product",
+                "search",
+                [domain],
+                {"limit": 1},
+            )
+            if ids:
+                return self._normalize_id(ids[0])
+        except Exception as exc:
+            logger.warning("No se pudo resolver default_code %s: %s", default_code, exc)
+        return None
+
+    def map_product_decision(self, invoice_product_name: str, odoo_product_id: Optional[int], supplier_id: int, default_code: Optional[str] = None) -> None:
+        """Registra la decisión humana asociando el detalle de factura a un product_id en supplierinfo."""
+        if not invoice_product_name:
+            raise ValueError("invoice_product_name es requerido para mapear el producto.")
+        product_id = self._normalize_id(odoo_product_id) if odoo_product_id is not None else None
+        supplier_id_norm = self._normalize_id(supplier_id)
+        if product_id is None and default_code:
+            product_id = self._resolve_product_by_default_code(default_code, supplier_id_norm)
+        if product_id is None or supplier_id_norm is None:
+            raise ValueError("Se requiere product_id (o default_code resoluble) y supplier_id válidos.")
+
+        fields = self._get_supplierinfo_fields()
+        partner_field = self._supplierinfo_partner_field()
+        product_field = self._supplierinfo_product_field()
+
+        product_data = self._execute_kw(
+            "product.product",
+            "read",
+            [[product_id]],
+            {"fields": ["product_tmpl_id", "name"]},
+        )
+        template_id = None
+        if product_data:
+            template_id = self._normalize_id(product_data[0].get("product_tmpl_id"))
+        if product_field == "product_tmpl_id":
+            target_product_ref = template_id if template_id is not None else product_id
+        else:
+            target_product_ref = product_id
+        domain = [
+            [product_field, "=", target_product_ref],
+            [partner_field, "=", supplier_id_norm],
+        ]
+        existing = self._execute_kw(
+            "product.supplierinfo",
+            "search_read",
+            [domain],
+            {"fields": ["id", "product_name"]},
+        )
+        if existing:
+            updates: Dict[str, Any] = {}
+            if "product_name" in fields and (existing[0].get("product_name") or "") != invoice_product_name:
+                updates["product_name"] = invoice_product_name
+            if updates:
+                self._execute_kw(
+                    "product.supplierinfo",
+                    "write",
+                    [[existing[0]["id"]], updates],
+                )
+            return
+
+        self._create_supplierinfo_record(
+            template_id,
+            product_id,
+            supplier_id_norm,
+            price=0.0,
+            product_name=invoice_product_name,
+        )
 
 
     def _select_supplier_candidate(self, supplier_name: str, candidate_ids: List[int]) -> Optional[int]:

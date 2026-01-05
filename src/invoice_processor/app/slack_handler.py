@@ -62,6 +62,7 @@ def run_slack_bot():
     configure_logging()
     allowed = load_allowed_users()
     message_queue = Queue()
+    last_file_by_thread: dict[str, Path] = {}
     slack_bot = SlackBot(
         app_token=settings.slack_app_token,
         bot_token=settings.slack_bot_token,
@@ -146,27 +147,36 @@ def run_slack_bot():
             if fetched_files:
                 files = fetched_files
 
+        file_path: Path | None = None
         if not files:
-            if not incoming_text:
-                logger.debug("Evento sin adjuntos ni texto; se ignora.")
+            # Reusar la última factura del thread si existe
+            file_path = last_file_by_thread.get(user_id) if user_id else None
+            if not file_path or not file_path.exists():
+                if not incoming_text:
+                    logger.debug("Evento sin adjuntos ni texto; se ignora.")
+                    continue
+                logger.info("Evento sin adjuntos y sin factura previa; solicitando nueva factura al usuario %s", user_id)
+                post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
                 continue
-            logger.info("Evento sin adjuntos; solicitando nueva factura al usuario %s", user_id)
-            post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
-            continue
+        else:
+            file_info = files[0]
+            mimetype = (file_info.get("mimetype") or file_info.get("filetype") or "").lower()
+            if "image" not in mimetype:
+                logger.info("Adjunto ignorado por no ser imagen (mimetype=%s).", mimetype)
+                post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
+                continue
+            try:
+                file_path = download_file(file_info, Path("/tmp/invoices") / (user_id or "unknown"))
+                if user_id:
+                    last_file_by_thread[user_id] = file_path
+            except Exception as exc:
+                logger.exception("No se pudo descargar el archivo de Slack")
+                post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
+                continue
 
-        # Valida que el archivo principal sea imagen; si no, solicita PNG/JPG.
-        file_info = files[0]
-        mimetype = (file_info.get("mimetype") or file_info.get("filetype") or "").lower()
-        if "image" not in mimetype:
-            logger.info("Adjunto ignorado por no ser imagen (mimetype=%s).", mimetype)
+        if not file_path:
+            logger.warning("No se pudo determinar la ruta del archivo para el evento; se solicita nueva factura.")
             post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
-            continue
-
-        try:
-            file_path = download_file(file_info, Path("/tmp/invoices") / user_id)
-        except Exception as exc:
-            logger.exception("No se pudo descargar el archivo de Slack")
-            post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
             continue
         config = {"configurable": {"thread_id": user_id}}
 
@@ -195,8 +205,32 @@ def run_slack_bot():
         # Prefiere la respuesta estructurada del modelo si existe; evita la conversación interna.
         response_model: InvoiceResponseModel | None = _coerce_response_model(result)
         if response_model:
-            response = response_model.summary
             needs_follow_up = bool(response_model.needs_follow_up)
+            if needs_follow_up and response_model.status == "WAITING_FOR_HUMAN" and response_model.products:
+                # Formatear candidatos de forma determinista para HITL
+                lines = []
+                for prod in response_model.products:
+                    cand_lines = []
+                    for idx, cand in enumerate(prod.candidates or [], start=1):
+                        cand_lines.append(
+                            f"   {idx}) id: {cand.get('id') if isinstance(cand, dict) else getattr(cand, 'id', None)} | default_code: {cand.get('default_code') if isinstance(cand, dict) else getattr(cand, 'default_code', None)} | nombre: {cand.get('name') if isinstance(cand, dict) else getattr(cand, 'name', None)} | score: {cand.get('score') if isinstance(cand, dict) else getattr(cand, 'score', None)}"
+                        )
+                    cand_text = "\n".join(cand_lines) if cand_lines else "   (sin candidatos)"
+                    lines.append(f"- {prod.detalle}:\n{cand_text}")
+                instructions = (
+                    "Responde 'Afirmativo' si todos los candidatos están OK y continuar con el flujo.\n"
+                    "O responde 'Negativo' indicando los default_code o IDs correctos por línea, ej:\n"
+                    "Aceite oliva -> MP022\nAceite tomate -> MP036\nAceite pepa uva -> MP024"
+                )
+                response = "\n".join(
+                    [
+                        "Flujo detenido: se requiere tu confirmación antes de continuar.",
+                        *lines,
+                        instructions,
+                    ]
+                )
+            else:
+                response = response_model.summary
         else:
             # Evita enviar conversación interna u objetos desconocidos.
             response = "No se pudo procesar la factura; revisa Odoo manualmente."
