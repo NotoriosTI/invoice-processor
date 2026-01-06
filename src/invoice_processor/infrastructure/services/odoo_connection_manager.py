@@ -126,40 +126,52 @@ class OdooConnectionManager:
     ) -> Optional[int]:
         if supplier_id:
             return int(supplier_id)
-        normalized_rut = self._normalize_vat(supplier_rut)
+        supplier_label = (supplier_name or "").strip()
+        normalized_rut = self._normalize_vat_strict(supplier_rut)
+        raw_rut = supplier_rut.strip() if isinstance(supplier_rut, str) else None
+
+        conditions: List[Tuple[str, str, Any]] = []
+        if supplier_label:
+            conditions.append(("name", "ilike", supplier_label))
         if normalized_rut:
-            try:
-                partners = self._execute_kw(
-                    "res.partner",
-                    "search_read",
-                    [[["vat", "=", normalized_rut]]],
-                    {"fields": ["id", "name", "vat"], "limit": 3},
-                )
-                if partners:
-                    return int(partners[0].get("id"))
-            except Exception:
-                return None
-        if not supplier_name:
+            conditions.append(("vat", "ilike", normalized_rut))
+        if raw_rut and raw_rut != normalized_rut:
+            conditions.append(("vat", "ilike", raw_rut))
+
+        if not conditions:
             return None
+
         try:
             candidates = self._execute_kw(
                 "res.partner",
                 "search_read",
-                [[["name", "ilike", supplier_name]]],
-                {"fields": ["id", "name"], "limit": 3},
+                [self._build_or_domain(conditions)],
+                {"fields": ["id", "name", "vat"], "limit": 5},
             )
+        except Exception:
+            return None
+
+        if not candidates:
+            return None
+
+        if normalized_rut:
+            for cand in candidates:
+                cand_vat = self._normalize_vat_strict(cand.get("vat"))
+                if cand_vat and cand_vat == normalized_rut:
+                    return int(cand.get("id"))
+
+        if supplier_label:
             best = None
             best_score = 0.0
             for cand in candidates or []:
-                score = self._string_similarity(supplier_name, cand.get("name"))
+                score = self._string_similarity(supplier_label, cand.get("name"))
                 if score > best_score:
                     best_score = score
                     best = cand
             if best:
                 return int(best.get("id"))
-        except Exception:
-            return None
-        return None
+
+        return int(candidates[0].get("id"))
 
     @staticmethod
     def _normalize_id(value: Any) -> Optional[int]:
@@ -506,11 +518,25 @@ class OdooConnectionManager:
             kwargs or {},
         )
 
-    def _normalize_vat(self, vat: Optional[str]) -> Optional[str]:
+    @staticmethod
+    def _build_or_domain(conditions: List[Tuple[str, str, Any]]) -> List[Any]:
+        if not conditions:
+            return []
+        if len(conditions) == 1:
+            return [conditions[0]]
+        return ["|"] * (len(conditions) - 1) + conditions
+
+    def _normalize_vat_strict(self, vat: Optional[str]) -> Optional[str]:
         if not vat:
             return None
-        cleaned = "".join(ch for ch in vat if ch.isalnum()).upper()
+        cleaned = vat.strip().upper()
+        if cleaned.startswith("CL"):
+            cleaned = cleaned[2:]
+        cleaned = "".join(ch for ch in cleaned if ch.isalnum())
         return cleaned or None
+
+    def _normalize_vat(self, vat: Optional[str]) -> Optional[str]:
+        return self._normalize_vat_strict(vat)
 
     def find_purchase_order_by_similarity(
         self,
@@ -1056,6 +1082,51 @@ class OdooConnectionManager:
             return "product_id"
         raise RuntimeError("No hay un campo para asociar el producto en product.supplierinfo.")
 
+    def _search_product_native_optimized(
+        self,
+        query: str,
+        supplier_id: Optional[int] = None,
+        limit: int = 10,
+    ) -> List[dict]:
+        if not query or not query.strip():
+            return []
+        raw_query = query.strip()
+        cleaned = re.sub(r"\s+", " ", raw_query.lower())
+        tokens = [
+            SYNONYM_MAP.get(token, token)
+            for token in cleaned.split()
+            if len(token) >= 3 and token not in STOPWORDS
+        ]
+        conditions: List[Tuple[str, str, str]] = [
+            ("default_code", "=ilike", raw_query),
+            ("default_code", "ilike", raw_query),
+        ]
+        for token in tokens:
+            conditions.append(("name", "ilike", token))
+
+        if not conditions:
+            return []
+
+        if len(conditions) == 1:
+            domain: List[Any] = [conditions[0]]
+        else:
+            domain = ["|"] * (len(conditions) - 1) + conditions
+
+        resolved_supplier_id = self._normalize_id(supplier_id) if supplier_id is not None else None
+        if resolved_supplier_id is not None:
+            domain = ["|", ("seller_ids.partner_id", "=", resolved_supplier_id)] + domain
+
+        try:
+            return self._execute_kw(
+                "product.product",
+                "search_read",
+                [domain],
+                {"fields": ["id", "name", "default_code", "seller_ids"], "limit": limit},
+            )
+        except Exception as exc:
+            logger.warning("Búsqueda nativa falló para '%s': %s", query, exc)
+            return []
+
     def _find_product_candidate(
         self,
         invoice_line: "InvoiceLine",
@@ -1153,96 +1224,122 @@ class OdooConnectionManager:
                 unit_bonus = 0.1
             return base * 0.2 + token_score * 0.6 + qty_bonus + unit_bonus
 
-        embedding_candidate = self._find_product_candidate_by_embedding(
-            invoice_line,
-            supplier_id=supplier_id,
-            supplier_name=supplier_name,
-        )
-        if embedding_candidate:
-            return embedding_candidate
-
         detail = invoice_line.detalle if hasattr(invoice_line, "detalle") else ""
+        if not detail:
+            return None
         target_norm = _normalize(detail)
         target_tokens = _tokens(detail)
         target_qty = _extract_quantity(detail)
         target_unit = _normalize_unit(getattr(invoice_line, "unidad", None))
 
-        search_terms = {detail}
-        if target_tokens:
-            search_terms.add(" ".join(target_tokens[:2]))
-            for tok in target_tokens:
-                if len(tok) >= 3:
-                    search_terms.add(tok)
+        resolved_supplier_id = self._resolve_supplier_id(supplier_id, supplier_name)
+        candidates_native = self._search_product_native_optimized(detail, supplier_id=resolved_supplier_id, limit=10)
+        supplier_id_norm = self._normalize_id(resolved_supplier_id) if resolved_supplier_id is not None else None
+        supplier_match_ids: set[int] = set()
+        if supplier_id_norm is not None and candidates_native:
+            seller_ids: set[int] = set()
+            for prod in candidates_native:
+                seller_ids.update(self._normalize_id_list(prod.get("seller_ids") or []))
+            if seller_ids:
+                try:
+                    partner_field = self._supplierinfo_partner_field()
+                    supplier_infos = self._execute_kw(
+                        "product.supplierinfo",
+                        "read",
+                        [self._normalize_id_list(list(seller_ids))],
+                        {"fields": ["id", partner_field]},
+                    )
+                    for info in supplier_infos:
+                        partner_ref = info.get(partner_field)
+                        partner_ref_id = self._normalize_id(partner_ref)
+                        if partner_ref_id == supplier_id_norm:
+                            info_id = self._normalize_id(info.get("id"))
+                            if info_id is not None:
+                                supplier_match_ids.add(info_id)
+                except Exception as exc:
+                    logger.warning("No se pudo validar seller_ids contra proveedor: %s", exc)
 
-        def _search_product_ids(term: str, domain_supplier: bool) -> List[int]:
-            if not term:
-                return []
-            base = ["|", ["name", "ilike", term], ["default_code", "ilike", term]]
-            domain = base
-            if domain_supplier:
-                resolved_supplier_id = self._resolve_supplier_id(supplier_id, supplier_name)
-                if resolved_supplier_id:
-                    domain = ["&", ["seller_ids.partner_id", "=", int(resolved_supplier_id)], base]
-                elif supplier_name:
-                    domain = ["&", ["seller_ids.name", "ilike", supplier_name], base]
-            try:
-                return self._execute_kw(
-                    "product.product",
-                    "search",
-                    [domain],
-                    {"limit": 10},
-                )
-            except Exception:
-                return []
-
-        product_ids: set[int] = set()
-        for term in search_terms:
-            product_ids.update(_search_product_ids(term, domain_supplier=True))
-
-        if not product_ids and supplier_id:
-            for term in search_terms:
-                product_ids.update(_search_product_ids(term, domain_supplier=False))
-
-        if not product_ids:
-            return None
-
-        products = self._execute_kw(
-            "product.product",
-            "read",
-            [self._normalize_id_list(list(product_ids))],
-            {"fields": ["id", "name", "default_code"]},
-        )
-        if not products:
-            return None
         best_product = None
         best_score = 0.0
-        best_token_score = 0.0
-        for prod in products:
+        for prod in candidates_native:
             cand_name = prod.get("name") or ""
             cand_norm = _normalize(cand_name)
             cand_tokens = _tokens(cand_name)
             cand_qty = _extract_quantity(cand_name)
             score = _score_candidate(target_norm, cand_norm, target_tokens, cand_tokens, target_qty, cand_qty, target_unit)
-            if target_tokens:
-                overlap = len(set(target_tokens) & set(cand_tokens))
-                token_cov = overlap / max(len(target_tokens), 1)
-            else:
-                token_cov = 0.0
             if score > best_score:
                 best_score = score
                 best_product = prod
-                best_token_score = token_cov
 
-        # Requiere buena cobertura de tokens aunque el ratio de cadena sea bajo.
-        if best_product and (best_score >= 0.65 or best_token_score >= 0.7):
-            logger.info(
-                "Producto detectado por similitud: %s (ID %s, score %.2f, token_cov %.2f)",
-                best_product.get("name"),
-                best_product.get("id"),
-                best_score,
-                best_token_score,
+        if best_product:
+            seller_ids = self._normalize_id_list(best_product.get("seller_ids") or [])
+            supplier_hit = bool(
+                supplier_id_norm is not None
+                and supplier_match_ids
+                and any(sid in supplier_match_ids for sid in seller_ids)
             )
-            return best_product.get("id")
+            if best_score > 0.90 or (best_score > 0.80 and supplier_hit):
+                logger.info(
+                    "Producto encontrado por Match Nativo (Score: %.2f): [%s] %s",
+                    best_score,
+                    best_product.get("id"),
+                    best_product.get("name"),
+                )
+                return best_product.get("id")
+
+        embedding_match = None
+        try:
+            embedding_match = self._find_product_candidate_by_embedding(
+                invoice_line,
+                supplier_id=resolved_supplier_id,
+                supplier_name=supplier_name,
+                return_score=True,
+            )
+        except Exception as exc:
+            logger.warning("Búsqueda por embeddings falló: %s", exc)
+
+        embedding_product = None
+        if embedding_match:
+            embedding_id, _score = embedding_match
+            try:
+                embedding_records = self._execute_kw(
+                    "product.product",
+                    "read",
+                    [self._normalize_id_list([embedding_id])],
+                    {"fields": ["id", "name", "default_code"]},
+                )
+                embedding_product = embedding_records[0] if embedding_records else None
+            except Exception as exc:
+                logger.warning("No se pudo leer el producto del embedding: %s", exc)
+                embedding_product = None
+
+        if embedding_product:
+            logger.info(
+                "Producto encontrado por Búsqueda Vectorial (Fallback): [%s] %s",
+                embedding_product.get("id"),
+                embedding_product.get("name"),
+            )
+
+        combined_candidates: List[dict] = list(candidates_native)
+        if embedding_product:
+            emb_id = self._normalize_id(embedding_product.get("id"))
+            if emb_id is not None and not any(self._normalize_id(p.get("id")) == emb_id for p in combined_candidates):
+                combined_candidates.append(embedding_product)
+
+        best_final = None
+        best_final_score = 0.0
+        for prod in combined_candidates:
+            cand_name = prod.get("name") or ""
+            cand_norm = _normalize(cand_name)
+            cand_tokens = _tokens(cand_name)
+            cand_qty = _extract_quantity(cand_name)
+            score = _score_candidate(target_norm, cand_norm, target_tokens, cand_tokens, target_qty, cand_qty, target_unit)
+            if score > best_final_score:
+                best_final_score = score
+                best_final = prod
+
+        if best_final and best_final_score > MIN_PRODUCT_CONFIDENCE:
+            return best_final.get("id")
         return None
 
     def get_product_candidates(
@@ -1348,123 +1445,15 @@ class OdooConnectionManager:
             if target_unit and cand_unit and target_unit == cand_unit:
                 unit_bonus = 0.1
             return base * 0.2 + token_score * 0.6 + qty_bonus + unit_bonus
-
-        def _search_product_ids(term: str, domain_supplier: bool) -> List[int]:
-            if not term:
-                return []
-            domain = [["name", "ilike", term]]
-            if domain_supplier:
-                resolved_supplier_id = self._resolve_supplier_id(supplier_id, supplier_name)
-                if resolved_supplier_id:
-                    domain.append(["seller_ids.partner_id", "=", int(resolved_supplier_id)])
-                elif supplier_name:
-                    domain.append(["seller_ids.name", "ilike", supplier_name])
-            try:
-                return self._execute_kw(
-                    "product.product",
-                    "search",
-                    [domain],
-                    {"limit": 10},
-                )
-            except Exception:
-                return []
-
         unidad = getattr(invoice_line, "unidad", None) if invoice_line is not None else None
         target_norm = _normalize(detail)
         target_tokens = _tokens(detail)
         target_qty = _extract_quantity(detail)
         target_unit = _normalize_unit(unidad)
 
-        search_terms = {detail}
-        if target_tokens:
-            search_terms.add(" ".join(target_tokens[:2]))
-            for tok in target_tokens:
-                if len(tok) >= 3:
-                    search_terms.add(tok)
-
-        product_ids: set[int] = set()
-        # 1) Intento filtrado por proveedor: si hay supplier_id/nombre, priorizar productos del proveedor.
-        for term in search_terms:
-            product_ids.update(_search_product_ids(term, domain_supplier=True))
-        # 2) Fallback global: si no hay resultados con proveedor, buscar global para ofrecer candidatos al usuario.
-        if not product_ids:
-            for term in search_terms:
-                product_ids.update(_search_product_ids(term, domain_supplier=False))
-
+        resolved_supplier_id = self._resolve_supplier_id(supplier_id, supplier_name)
+        product_records = self._search_product_native_optimized(detail, supplier_id=resolved_supplier_id, limit=10)
         candidates: List[Dict[str, Any]] = []
-
-        line_for_embedding = invoice_line or SimpleNamespace(detalle=detail, unidad=unidad)
-        try:
-            embedding_match = self._find_product_candidate_by_embedding(
-                line_for_embedding,
-                supplier_id=supplier_id,
-                supplier_name=supplier_name,
-                return_score=True,
-            )
-        except Exception as exc:
-            logger.warning("Búsqueda por embedding falló: %s", exc)
-            embedding_match = None
-
-        if embedding_match:
-            emb_id, emb_score = embedding_match
-            emb_norm = self._normalize_id(emb_id)
-            if emb_norm is not None:
-                product_ids.add(emb_norm)
-                candidates.append({"id": emb_norm, "score": float(emb_score)})
-
-        product_records = []
-        if product_ids:
-            try:
-                product_records = self._execute_kw(
-                    "product.product",
-                    "read",
-                    [self._normalize_id_list(list(product_ids))],
-                    {"fields": ["id", "name", "default_code", "product_tag_ids", "seller_ids", "purchase_ok", "sale_ok", "categ_id"]},
-                )
-            except Exception as exc:
-                logger.warning("No se pudieron leer productos para candidatos: %s", exc)
-                product_records = []
-
-        tag_names_by_product: Dict[int, set[str]] = {}
-        supplier_id_norm = self._normalize_id(supplier_id) if supplier_id is not None else None
-
-        product_by_id: Dict[int, Dict[str, Any]] = {}
-
-        if product_records:
-            pid_list = [self._normalize_id(prod.get("id")) for prod in product_records if prod.get("id") is not None]
-            tag_by_pid = self._product_tags_for_ids([pid for pid in pid_list if pid is not None])
-            # Completar nombres de tags faltantes desde product.tag
-            missing_tag_ids: set[int] = set()
-            for tags_ids in (tag_by_pid or {}).values():
-                for tid in tags_ids or []:
-                    if tid not in self._tag_cache:
-                        missing_tag_ids.add(tid)
-            if missing_tag_ids:
-                try:
-                    tag_records = self._execute_kw(
-                        "product.tag",
-                        "read",
-                        [list(missing_tag_ids)],
-                        {"fields": ["id", "name"]},
-                    )
-                    for rec in tag_records or []:
-                        tid = self._normalize_id(rec.get("id"))
-                        tname = rec.get("name")
-                        if tid is not None and tname:
-                            self._tag_cache[tid] = tname
-                except Exception as exc:
-                    logger.debug("No se pudieron leer nombres de tags faltantes: %s", exc)
-            for pid, tag_ids in (tag_by_pid or {}).items():
-                names: set[str] = set()
-                for tid in tag_ids or []:
-                    tname = self._tag_cache.get(tid)
-                    if tname:
-                        names.add(tname)
-                tag_names_by_product[pid] = names
-            for prod in product_records or []:
-                pid = self._normalize_id(prod.get("id"))
-                if pid is not None:
-                    product_by_id[pid] = prod
 
         for prod in product_records or []:
             cand_name = prod.get("name") or ""
@@ -1472,37 +1461,67 @@ class OdooConnectionManager:
             cand_tokens = _tokens(cand_name)
             cand_qty = _extract_quantity(cand_name)
             score = _score_candidate(target_norm, cand_norm, target_tokens, cand_tokens, target_qty, cand_qty, target_unit)
-
-            supplier_bonus = 0.0
-            seller_ids = self._normalize_id_list(prod.get("seller_ids") or [])
-            if supplier_id_norm is not None:
-                if supplier_id_norm in seller_ids:
-                    supplier_bonus = 0.5
-                elif seller_ids:
-                    supplier_bonus = -0.2
-                else:
-                    supplier_bonus = -0.5
-            elif seller_ids:
-                supplier_bonus = 0.1
-
-            # Refuerzo: si hay proveedor esperado y el producto NO tiene seller_ids de nadie, penalización extra
-            if supplier_id_norm is not None and not seller_ids:
-                supplier_bonus -= 0.2
-
-            purchase_bonus = 0.1 if prod.get("purchase_ok") else -0.25
-            sale_penalty = -0.5 if (prod.get("sale_ok") and not prod.get("purchase_ok")) else 0.0
-
-            final_score = score + supplier_bonus + purchase_bonus + sale_penalty
             dc = prod.get("default_code")
             dc = dc if dc not in (False, None, "") else None
             candidates.append(
                 {
                     "id": prod.get("id"),
                     "name": cand_name,
-                    "score": float(final_score),
+                    "score": float(score),
                     "default_code": dc,
                 }
             )
+
+        line_for_embedding = invoice_line or SimpleNamespace(detalle=detail, unidad=unidad)
+        embedding_match = None
+        try:
+            embedding_match = self._find_product_candidate_by_embedding(
+                line_for_embedding,
+                supplier_id=resolved_supplier_id,
+                supplier_name=supplier_name,
+                return_score=True,
+            )
+        except Exception as exc:
+            logger.warning("Búsqueda por embedding falló: %s", exc)
+
+        if embedding_match:
+            emb_id, _emb_score = embedding_match
+            emb_norm = self._normalize_id(emb_id)
+            if emb_norm is not None and not any(self._normalize_id(c.get("id")) == emb_norm for c in candidates):
+                try:
+                    emb_records = self._execute_kw(
+                        "product.product",
+                        "read",
+                        [self._normalize_id_list([emb_norm])],
+                        {"fields": ["id", "name", "default_code"]},
+                    )
+                    if emb_records:
+                        emb_prod = emb_records[0]
+                        cand_name = emb_prod.get("name") or ""
+                        cand_norm = _normalize(cand_name)
+                        cand_tokens = _tokens(cand_name)
+                        cand_qty = _extract_quantity(cand_name)
+                        score = _score_candidate(
+                            target_norm,
+                            cand_norm,
+                            target_tokens,
+                            cand_tokens,
+                            target_qty,
+                            cand_qty,
+                            target_unit,
+                        )
+                        dc = emb_prod.get("default_code")
+                        dc = dc if dc not in (False, None, "") else None
+                        candidates.append(
+                            {
+                                "id": emb_prod.get("id"),
+                                "name": cand_name,
+                                "score": float(score),
+                                "default_code": dc,
+                            }
+                        )
+                except Exception as exc:
+                    logger.warning("No se pudo leer producto embedding para candidatos: %s", exc)
 
         best_by_id: Dict[int, Dict[str, Any]] = {}
         for cand in candidates:
@@ -1514,13 +1533,9 @@ class OdooConnectionManager:
             raw_default_code = cand.get("default_code")
             if raw_default_code in (False, None, ""):
                 raw_default_code = None
-            if raw_default_code is None and product_by_id:
-                raw_default_code = product_by_id.get(pid, {}).get("default_code")
-            if raw_default_code in (False, None, ""):
-                raw_default_code = None
             payload = {
                 "id": pid,
-                "name": cand.get("name") or (product_by_id.get(pid, {}).get("name") if product_by_id else None),
+                "name": cand.get("name"),
                 "default_code": raw_default_code,
                 "score": round(cand_score, 3),
             }
@@ -2021,24 +2036,43 @@ class OdooConnectionManager:
 
     def _find_or_create_supplier(self, supplier_name: str, supplier_rut: Optional[str] = None) -> int:
         supplier_label = (supplier_name or "Proveedor Desconocido").strip()
-        normalized_rut = self._normalize_vat(supplier_rut)
-        partner_ids: List[int] = []
+        normalized_rut = self._normalize_vat_strict(supplier_rut)
+        raw_rut = supplier_rut.strip() if isinstance(supplier_rut, str) else None
+        conditions: List[Tuple[str, str, Any]] = []
+        if supplier_label:
+            conditions.append(("name", "ilike", supplier_label))
         if normalized_rut:
-            partner_ids = self._execute_kw(
+            conditions.append(("vat", "ilike", normalized_rut))
+        if raw_rut and raw_rut != normalized_rut:
+            conditions.append(("vat", "ilike", raw_rut))
+        domain = self._build_or_domain(conditions)
+        try:
+            partners = self._execute_kw(
                 "res.partner",
-                "search",
-                [[["vat", "=", normalized_rut]]],
-                {"limit": 10},
+                "search_read",
+                [domain],
+                {"fields": ["id", "name", "vat", "supplier_rank"], "limit": 5},
             )
-        if not partner_ids:
-            partner_ids = self._execute_kw(
-                "res.partner",
-                "search",
-                [[["name", "ilike", supplier_label]]],
-                {"limit": 10},
+        except Exception as exc:
+            logger.warning("No se pudo buscar proveedor en Odoo: %s", exc)
+            partners = []
+
+        best_partner: Optional[dict] = None
+        best_score = 0.0
+        for partner in partners or []:
+            score = self._string_similarity(supplier_label, partner.get("name"))
+            if score > best_score:
+                best_score = score
+                best_partner = partner
+
+        if best_partner:
+            logger.info(
+                "Proveedor detectado por similitud: %s (ID %s, score %.2f)",
+                best_partner.get("name"),
+                best_partner.get("id"),
+                best_score,
             )
-        selected = self._select_supplier_candidate(supplier_label, self._normalize_id_list(partner_ids))
-        if selected:
+            selected = self._normalize_id(best_partner.get("id"))
             # Si existe pero no está marcado como proveedor, se actualiza supplier_rank=1.
             try:
                 selected_id = self._normalize_id(selected)
@@ -2065,7 +2099,7 @@ class OdooConnectionManager:
                     selected_id,
                     exc,
                 )
-            return selected
+            return int(selected)
         logger.info(
             "No se encontró proveedor para '%s'. Se creará automáticamente uno nuevo.",
             supplier_label,
