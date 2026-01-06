@@ -1,5 +1,5 @@
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 class InvoiceLine(BaseModel):
@@ -48,13 +48,31 @@ class ProductCandidate(BaseModel):
     id: int = Field(..., description="ID del producto en Odoo")
     name: Optional[str] = Field(default=None, description="Nombre del producto en Odoo")
     score: Optional[float] = Field(default=None, description="Score de similitud")
-    default_code: Optional[str] = Field(default=None, description="SKU/default_code en Odoo")
     default_code: Optional[str] = Field(default=None, description="Código interno (SKU) del producto en Odoo")
+
+    @field_validator("default_code", mode="before")
+    @classmethod
+    def _normalize_default_code(cls, value):
+        if value in (False, None, ""):
+            return None
+        return value
 
 
 class ProcessedProduct(BaseModel):
     model_config = ConfigDict(extra="forbid")
     detalle: str
+    invoice_detail: Optional[str] = Field(
+        default=None, description="Nombre del producto tal como aparece en la factura"
+    )
+    candidate_name: Optional[str] = Field(
+        default=None, description="Nombre del producto propuesto en Odoo"
+    )
+    candidate_default_code: Optional[str] = Field(
+        default=None, description="SKU/default_code del producto propuesto en Odoo"
+    )
+    supplier_name: Optional[str] = Field(
+        default=None, description="Nombre del proveedor detectado en la factura"
+    )
     cantidad_match: bool
     precio_match: bool
     subtotal_match: bool
@@ -77,6 +95,12 @@ class InvoiceResponseModel(BaseModel):
     total_match: Optional[bool] = None
     supplier_id: Optional[int] = Field(
         default=None, description="ID de proveedor usado para mapear productos"
+    )
+    supplier_name: Optional[str] = Field(
+        default=None, description="Nombre del proveedor detectado en la factura"
+    )
+    supplier_rut: Optional[str] = Field(
+        default=None, description="RUT/tax_id del proveedor detectado en la factura"
     )
     status: Optional[Literal["WAITING_FOR_HUMAN"]] = Field(
         default=None, description="Estado global del flujo de la factura"

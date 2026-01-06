@@ -1,12 +1,13 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 import logging
+import os
 import re
 import unicodedata
 from rich.logging import RichHandler
 from rich.traceback import install
 from difflib import SequenceMatcher
 
-from ..infrastructure.services.odoo_connection_manager import odoo_manager
+from ..infrastructure.services.odoo_connection_manager import MIN_PRODUCT_CONFIDENCE, odoo_manager
 from .models import InvoiceData, InvoiceLine, ProcessedProduct, InvoiceResponseModel
 from ..infrastructure.services.ocr import InvoiceOcrClient
 
@@ -20,6 +21,12 @@ if not logging.getLogger().handlers:
 
 logger = logging.getLogger(__name__)
 ocr_client = InvoiceOcrClient()
+
+def _truthy_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _apply_line_discounts(invoice: InvoiceData) -> InvoiceData:
@@ -130,8 +137,13 @@ def _build_order_summary(order: dict) -> Dict[str, any]:
     }
 
 
-def _match_line(invoice_line: InvoiceLine, order_lines: List[dict]) -> dict | None:
-    """Encuentra la línea de Odoo cuyo DETALLE coincida con la línea de factura, con fallback por similitud."""
+def _match_line(
+    invoice_line: InvoiceLine,
+    order_lines: List[dict],
+    expected_product_id: int | None = None,
+    used_line_ids: set[int] | None = None,
+) -> dict | None:
+    """Encuentra la línea de Odoo que corresponde a la línea de factura."""
     def _normalize(text: str) -> str:
         if not text:
             return ""
@@ -146,31 +158,68 @@ def _match_line(invoice_line: InvoiceLine, order_lines: List[dict]) -> dict | No
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
+    def _accept(line: dict) -> dict:
+        if used_line_ids is not None and line.get("id") is not None:
+            used_line_ids.add(line["id"])
+        return line
+
+    def _score_line(line: dict) -> float:
+        candidate_raw = (line.get("detalle") or "").strip()
+        candidate = _normalize(candidate_raw)
+        if not candidate:
+            return 0.0
+        if candidate_raw.lower() == target_raw.lower():
+            return 1.0
+        if target and candidate and (target in candidate or candidate in target):
+            return 0.95
+        return SequenceMatcher(None, target, candidate).ratio()
+
     target_raw = (invoice_line.detalle or "").strip()
     target = _normalize(target_raw)
+    used_line_ids = used_line_ids or set()
+
+    if expected_product_id is not None:
+        candidates = [
+            line
+            for line in order_lines
+            if line.get("product_id") == expected_product_id and line.get("id") not in used_line_ids
+        ]
+        if candidates:
+            best_line = None
+            best_key = None
+            for line in candidates:
+                qty_diff = abs(float(line.get("cantidad", 0.0)) - float(invoice_line.cantidad))
+                score = _score_line(line)
+                key = (qty_diff, -score)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_line = line
+            if best_line is not None:
+                return _accept(best_line)
+
     best_line = None
     best_score = 0.0
     for line in order_lines:
-        candidate_raw = (line.get("detalle") or "").strip()
-        candidate = _normalize(candidate_raw)
-        if candidate_raw.lower() == target_raw.lower():
-            return line
-        if target and candidate and (target in candidate or candidate in target):
-            best_line = line
-            best_score = 1.0
-            return line
-        score = SequenceMatcher(None, target, candidate).ratio()
+        if line.get("id") in used_line_ids:
+            continue
+        score = _score_line(line)
         if score > best_score:
             best_score = score
             best_line = line
-    if best_score >= 0.5:
-        return best_line
+        if score >= 0.95:
+            return _accept(line)
+    if best_line is not None and best_score >= 0.5:
+        return _accept(best_line)
     return None
 
 
-def _verify_line(invoice_line: InvoiceLine, order_lines: List[dict]) -> ProcessedProduct:
+def _verify_line(
+    invoice_line: InvoiceLine,
+    order_lines: List[dict],
+    matched_line: dict | None = None,
+) -> ProcessedProduct:
     """Compara cantidad, precio unitario y subtotal de una línea contra lo que devuelve Odoo."""
-    order_line = _match_line(invoice_line, order_lines)
+    order_line = matched_line or _match_line(invoice_line, order_lines)
     if not order_line:
         return ProcessedProduct(
             detalle=invoice_line.detalle,
@@ -352,26 +401,60 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     if not invoice.lines:
         raise ValueError("La factura no contiene líneas de productos para comparar.")
 
-    resolved_supplier_id = odoo_manager._resolve_supplier_id(None, invoice.supplier_name)
+    resolved_supplier_id = odoo_manager._resolve_supplier_id(
+        None,
+        invoice.supplier_name,
+        getattr(invoice, "supplier_rut", None),
+    )
     pending_products: List[ProcessedProduct] = []
+    expected_product_ids: List[Optional[int]] = []
+    require_confirmation = _truthy_env("REQUIRE_PRODUCT_CONFIRMATION", default=True)
     for line in invoice.lines:
+        invoice_detail = line.detalle
+        mapped_product_id = (
+            odoo_manager.get_mapped_product_id(invoice_detail, resolved_supplier_id)
+            if resolved_supplier_id is not None
+            else None
+        )
         candidates = odoo_manager.get_product_candidates(
-            line.detalle,
+            invoice_detail,
             supplier_id=resolved_supplier_id,
             supplier_name=invoice.supplier_name,
             invoice_line=line,
         )
-        pending_products.append(
-            ProcessedProduct(
-                detalle=line.detalle,
-                cantidad_match=False,
-                precio_match=False,
-                subtotal_match=False,
-                issues="Confirma el producto correcto antes de continuar.",
-                status="AMBIGUOUS",
-                candidates=candidates,
+        best = candidates[0] if candidates else None
+        best_score = float(best.get("score") or 0.0) if isinstance(best, dict) else 0.0
+        best_default_code = best.get("default_code") if isinstance(best, dict) else None
+        if best_default_code in (False, None, ""):
+            best_default_code = None
+        best_id = odoo_manager._normalize_id(best.get("id")) if isinstance(best, dict) else None
+        expected_product_ids.append(mapped_product_id or best_id)
+
+        needs_review = False
+        if mapped_product_id is None:
+            if require_confirmation:
+                needs_review = True
+            elif not candidates:
+                needs_review = True
+            elif best_score < MIN_PRODUCT_CONFIDENCE:
+                needs_review = True
+
+        if needs_review:
+            pending_products.append(
+                ProcessedProduct(
+                    detalle=invoice_detail,
+                    invoice_detail=invoice_detail,
+                    candidate_name=(best.get("name") if isinstance(best, dict) else None),
+                    candidate_default_code=best_default_code,
+                    supplier_name=invoice.supplier_name,
+                    cantidad_match=False,
+                    precio_match=False,
+                    subtotal_match=False,
+                    issues="Confirma el producto correcto antes de continuar.",
+                    status="AMBIGUOUS",
+                    candidates=candidates,
+                )
             )
-        )
 
     if pending_products:
         summary_msg = "Flujo detenido: se requieren decisiones humanas para mapear productos antes de continuar."
@@ -385,6 +468,8 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
             iva_match=None,
             total_match=None,
             supplier_id=resolved_supplier_id,
+            supplier_name=invoice.supplier_name,
+            supplier_rut=getattr(invoice, "supplier_rut", None),
             status="WAITING_FOR_HUMAN",
         )
 
@@ -414,9 +499,16 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
 
     products: List[ProcessedProduct] = []
     qty_by_product: Dict[int, float] = {}
-    for line in invoice.lines:
-        product_result = _verify_line(line, summary["lines"])
-        matched_line = _match_line(line, summary["lines"])
+    used_line_ids: set[int] = set()
+    for idx, line in enumerate(invoice.lines):
+        expected_product_id = expected_product_ids[idx] if idx < len(expected_product_ids) else None
+        matched_line = _match_line(
+            line,
+            summary["lines"],
+            expected_product_id=expected_product_id,
+            used_line_ids=used_line_ids,
+        )
+        product_result = _verify_line(line, summary["lines"], matched_line=matched_line)
 
         if matched_line and matched_line.get("id"):
             prod_id = matched_line.get("product_id")

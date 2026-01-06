@@ -18,7 +18,7 @@ variables:
   LLM_MODEL:
     source: LLM_MODEL
     type: str
-    default: "gpt-4o-mini"
+    default: "gpt-5.2"
 
   EMBEDDING_MODEL:
     source: EMBEDDING_MODEL

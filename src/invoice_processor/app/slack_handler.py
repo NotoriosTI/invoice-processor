@@ -207,26 +207,34 @@ def run_slack_bot():
         if response_model:
             needs_follow_up = bool(response_model.needs_follow_up)
             if needs_follow_up and response_model.status == "WAITING_FOR_HUMAN" and response_model.products:
-                # Formatear candidatos de forma determinista para HITL
-                lines = []
-                for prod in response_model.products:
-                    cand_lines = []
-                    for idx, cand in enumerate(prod.candidates or [], start=1):
-                        cand_lines.append(
-                            f"   {idx}) id: {cand.get('id') if isinstance(cand, dict) else getattr(cand, 'id', None)} | default_code: {cand.get('default_code') if isinstance(cand, dict) else getattr(cand, 'default_code', None)} | nombre: {cand.get('name') if isinstance(cand, dict) else getattr(cand, 'name', None)} | score: {cand.get('score') if isinstance(cand, dict) else getattr(cand, 'score', None)}"
-                        )
-                    cand_text = "\n".join(cand_lines) if cand_lines else "   (sin candidatos)"
-                    lines.append(f"- {prod.detalle}:\n{cand_text}")
-                instructions = (
-                    "Responde 'Afirmativo' si todos los candidatos están OK y continuar con el flujo.\n"
-                    "O responde 'Negativo' indicando los default_code o IDs correctos por línea, ej:\n"
-                    "Aceite oliva -> MP022\nAceite tomate -> MP036\nAceite pepa uva -> MP024"
-                )
+                first = response_model.products[0]
+                supplier_name = getattr(first, "supplier_name", None) or "Desconocido"
+                lines: list[str] = []
+                for idx, prod in enumerate(response_model.products, start=1):
+                    invoice_detail = getattr(prod, "invoice_detail", None) or getattr(prod, "detalle", None) or ""
+                    candidate_name = getattr(prod, "candidate_name", None)
+                    candidate_default_code = getattr(prod, "candidate_default_code", None)
+                    if not candidate_name and getattr(prod, "candidates", None):
+                        best = (prod.candidates or [None])[0]
+                        candidate_name = getattr(best, "name", None) if best is not None else None
+                        candidate_default_code = getattr(best, "default_code", None) if best is not None else None
+                    candidate_name = candidate_name or "(sin candidato)"
+                    sku_label = candidate_default_code or "N/A"
+                    lines.append(
+                        f"{idx}. *{invoice_detail}* ➔  _{candidate_name}_  (SKU: `{sku_label}`)"
+                    )
+
                 response = "\n".join(
                     [
-                        "Flujo detenido: se requiere tu confirmación antes de continuar.",
+                        "🛑 *Confirmación Requerida*",
+                        f"Proveedor Detectado: {supplier_name}",
+                        "",
+                        "*Productos por Ingresar a Odoo:*",
                         *lines,
-                        instructions,
+                        "",
+                        "*Instrucciones:*",
+                        '- Si la lista es correcta, responde: *"Afirmativo"*. ',
+                        '- Para corregir, indica: *"Cambiar {Producto Factura} por {Nombre Correcto o SKU}"*.',
                     ]
                 )
             else:

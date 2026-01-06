@@ -132,6 +132,7 @@ class InvoiceOcrClient:
         cleaned_lines: List[Dict[str, Any]] = []
         for line in payload.get("lines") or []:
             cleaned_line = dict(line)
+            cleaned_line.pop("warning", None)
             cleaned_line["cantidad"] = _round2(line.get("cantidad"))
             cleaned_line["precio_unitario"] = _round2(line.get("precio_unitario"))
             cleaned_line["unidad"] = _normalize_unit(line.get("unidad"))
@@ -150,8 +151,13 @@ class InvoiceOcrClient:
                 cleaned_line["descuento_monto"] = descuento_monto
             # Si hay diferencia > $1 y no hay descuento_monto que la explique, corrige al calc_sub.
             if raw_sub is not None and calc_sub is not None and abs(calc_sub - raw_sub) > 1.0 and not descuento_monto:
-                cleaned_line["warning"] = f"subtotal corregido (calc {calc_sub} vs raw {raw_sub})"
-                warnings.append(cleaned_line["warning"])
+                detail_label = cleaned_line.get("detalle") or line.get("detalle")
+                if detail_label:
+                    warnings.append(
+                        f"subtotal corregido en '{detail_label}' (calc {calc_sub} vs raw {raw_sub})"
+                    )
+                else:
+                    warnings.append(f"subtotal corregido (calc {calc_sub} vs raw {raw_sub})")
                 cleaned_line["subtotal"] = calc_sub
             else:
                 cleaned_line["subtotal"] = raw_sub if raw_sub is not None else calc_sub

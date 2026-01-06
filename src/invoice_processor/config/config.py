@@ -29,7 +29,7 @@ class Settings:
         self.odoo_username = require_config("ODOO_TEST_USERNAME")
         self.odoo_password = require_config("ODOO_TEST_PASSWORD")
         self.openai_api_key = require_config("OPENAI_API_KEY")
-        self.llm_model = get_config("LLM_MODEL", "gpt-4o-mini")
+        self.llm_model = get_config("LLM_MODEL", "gpt-5.2")
         self.embedding_model = get_config("EMBEDDING_MODEL", "text-embedding-3-small")
         self.slack_app_token = require_config("SLACK_APP_TOKEN")
         self.slack_bot_token = require_config("SLACK_BOT_TOKEN")

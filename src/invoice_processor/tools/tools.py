@@ -17,7 +17,14 @@ class ProcessInvoiceArgs(BaseModel):
 class MapProductDecisionArgs(BaseModel):
     invoice_detail: str = Field(..., description="Nombre del producto tal como aparece en la factura")
     odoo_product_id: int | None = Field(default=None, description="ID del producto seleccionado en Odoo (si se conoce)")
-    supplier_id: int = Field(..., description="ID del proveedor en Odoo")
+    supplier_id: int | None = Field(default=None, description="ID del proveedor en Odoo")
+    supplier_name: str | None = Field(
+        default=None,
+        description="Nombre del proveedor tal como aparece en la factura/Odoo (si falta supplier_id)",
+    )
+    supplier_rut: str | None = Field(
+        default=None, description="RUT/tax_id del proveedor (si falta supplier_id)"
+    )
     default_code: str | None = Field(default=None, description="Código interno (SKU) del producto en Odoo")
 
 
@@ -44,7 +51,45 @@ def process_invoice_purchase_flow(image_path: str) -> InvoiceResponseModel:
 
 
 @tool("map_product_decision_tool", args_schema=MapProductDecisionArgs)
-def map_product_decision_tool(invoice_detail: str, odoo_product_id: int | None, supplier_id: int, default_code: str | None = None) -> str:
-    """Guarda la decisión humana del producto, enlazando el nombre de factura con el ID de Odoo."""
+def map_product_decision_tool(
+    invoice_detail: str,
+    odoo_product_id: int | None,
+    supplier_id: int | None,
+    default_code: str | None = None,
+    supplier_name: str | None = None,
+    supplier_rut: str | None = None,
+) -> str:
+    """Registra el mapeo en `product.supplierinfo` (memoria de mapeo). No modifica `purchase.order`."""
+    if supplier_id is None:
+        supplier_id = odoo_manager._resolve_supplier_id(None, supplier_name, supplier_rut)
+    if supplier_id is None:
+        raise ValueError("No se pudo resolver supplier_id. Provee supplier_id o supplier_name/supplier_rut válidos.")
     odoo_manager.map_product_decision(invoice_detail, odoo_product_id, supplier_id, default_code=default_code)
-    return "Decisión registrada. Reintenta el procesamiento de la factura."
+    resolved_product_id = odoo_manager._normalize_id(odoo_product_id) if odoo_product_id is not None else None
+    if resolved_product_id is None and default_code:
+        try:
+            resolved_product_id = odoo_manager._resolve_product_by_default_code(
+                default_code, odoo_manager._normalize_id(supplier_id)
+            )
+        except Exception:
+            resolved_product_id = None
+    product_name = None
+    product_sku = None
+    if resolved_product_id is not None:
+        try:
+            recs = odoo_manager._execute_kw(
+                "product.product",
+                "search_read",
+                [[["id", "=", resolved_product_id]]],
+                {"fields": ["name", "default_code"], "limit": 1},
+            )
+            if recs:
+                product_name = recs[0].get("name")
+                sku = recs[0].get("default_code")
+                product_sku = sku if sku not in (False, None, "") else None
+        except Exception:
+            product_name = None
+            product_sku = None
+    target = product_name or (product_sku or resolved_product_id or default_code or "producto")
+    sku_info = f" (SKU: {product_sku})" if product_sku else ""
+    return f"Mapeo registrado: '{invoice_detail}' ahora apunta a '{target}'{sku_info}. Revisa la lista nuevamente."

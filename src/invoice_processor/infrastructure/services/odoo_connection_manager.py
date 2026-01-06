@@ -118,9 +118,27 @@ class OdooConnectionManager:
         self._product_embeddings_cache: Optional[Dict[str, Any]] = None
         self._product_embeddings_cache_by_supplier: Dict[int, Dict[str, Any]] = {}
 
-    def _resolve_supplier_id(self, supplier_id: Optional[int], supplier_name: Optional[str]) -> Optional[int]:
+    def _resolve_supplier_id(
+        self,
+        supplier_id: Optional[int],
+        supplier_name: Optional[str],
+        supplier_rut: Optional[str] = None,
+    ) -> Optional[int]:
         if supplier_id:
             return int(supplier_id)
+        normalized_rut = self._normalize_vat(supplier_rut)
+        if normalized_rut:
+            try:
+                partners = self._execute_kw(
+                    "res.partner",
+                    "search_read",
+                    [[["vat", "=", normalized_rut]]],
+                    {"fields": ["id", "name", "vat"], "limit": 3},
+                )
+                if partners:
+                    return int(partners[0].get("id"))
+            except Exception:
+                return None
         if not supplier_name:
             return None
         try:
@@ -168,6 +186,24 @@ class OdooConnectionManager:
             except Exception:
                 return None
         return None
+
+    @staticmethod
+    def _sanitize_default_code(value: Any) -> Optional[str]:
+        """Normaliza un SKU/default_code (quita espacios/puntuación típica de texto libre)."""
+        if value in (None, False):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        # Remueve wrappers típicos en Slack/Markdown.
+        text = text.strip("`'\"").strip()
+        # Remueve espacios internos.
+        text = re.sub(r"\s+", "", text)
+        # Remueve puntuación/ruido al inicio/fin (ej: "MP026.", "(MP026)").
+        text = re.sub(r"^[^A-Za-z0-9]+", "", text)
+        text = re.sub(r"[^A-Za-z0-9_-]+$", "", text)
+        text = text.upper()
+        return text or None
 
     @staticmethod
     def _normalize_id_list(values: List[Any]) -> List[int]:
@@ -674,10 +710,13 @@ class OdooConnectionManager:
         parsed = []
         for line in lines:
             product_info = products.get(line["product_id"][0]) if line.get("product_id") else {}
+            line_name = line.get("name")
             parsed.append(
                 {
                     "id": line["id"],
-                    "detalle": product_info.get("name") or line.get("name"),
+                    "detalle": line_name or product_info.get("name"),
+                    "line_name": line_name,
+                    "product_name": product_info.get("name"),
                     "sku": product_info.get("default_code"),
                     "cantidad": line.get("product_qty", 0.0),
                     "precio_unitario": line.get("price_unit", 0.0),
@@ -1472,10 +1511,17 @@ class OdooConnectionManager:
                 continue
             existing = best_by_id.get(pid)
             cand_score = float(cand.get("score") or 0.0)
+            raw_default_code = cand.get("default_code")
+            if raw_default_code in (False, None, ""):
+                raw_default_code = None
+            if raw_default_code is None and product_by_id:
+                raw_default_code = product_by_id.get(pid, {}).get("default_code")
+            if raw_default_code in (False, None, ""):
+                raw_default_code = None
             payload = {
                 "id": pid,
                 "name": cand.get("name") or (product_by_id.get(pid, {}).get("name") if product_by_id else None),
-                "default_code": cand.get("default_code") or (product_by_id.get(pid, {}).get("default_code") if product_by_id else None),
+                "default_code": raw_default_code,
                 "score": round(cand_score, 3),
             }
             if not existing or cand_score > existing.get("score", 0.0):
@@ -1647,38 +1693,53 @@ class OdooConnectionManager:
                     [[pid]],
                     {"fields": ["seller_ids"]},
                 )
-                sellers = self._normalize_id_list(recs[0].get("seller_ids") or []) if recs else []
-                return supplier_id_norm in sellers
+                seller_ids = self._normalize_id_list(recs[0].get("seller_ids") or []) if recs else []
+                if not seller_ids:
+                    return False
+                partner_field = self._supplierinfo_partner_field()
+                supplier_infos = self._execute_kw(
+                    "product.supplierinfo",
+                    "read",
+                    [self._normalize_id_list(seller_ids)],
+                    {"fields": ["id", partner_field]},
+                )
+                for info in supplier_infos:
+                    partner_ref = info.get(partner_field)
+                    partner_ref_id = self._normalize_id(partner_ref)
+                    if partner_ref_id == supplier_id_norm:
+                        return True
             except Exception:
                 return False
+            return False
+
+        def _accept_explicit_product(pid: int) -> Optional[int]:
+            if supplier_id is not None and not _product_has_supplier(pid):
+                self._ensure_supplier_on_product(pid, supplier_id, invoice_line.precio_unitario)
+            if not force_hitl:
+                return pid
+            return None
         # 1) Mapeo directo por SKU si viene en la línea
         sku = getattr(invoice_line, "sku", None) or getattr(invoice_line, "default_code", None)
         if sku:
             pid_by_sku = self.get_product_id_by_sku(str(sku))
             if pid_by_sku is not None:
-                if _product_has_supplier(pid_by_sku):
-                    if supplier_id is not None:
-                        self._ensure_supplier_on_product(pid_by_sku, supplier_id, invoice_line.precio_unitario)
-                    if not force_hitl:
-                        return pid_by_sku
+                accepted = _accept_explicit_product(pid_by_sku)
+                if accepted is not None:
+                    return accepted
                 # Si FORCE_HITL está activo y no hay seller válido, seguir a candidatos.
 
         # 2) Mapeo directo por supplierinfo.product_name
         mapped_id = self.get_mapped_product_id(getattr(invoice_line, "detalle", None), supplier_id)
         if mapped_id is not None:
-            if _product_has_supplier(mapped_id):
-                if supplier_id is not None:
-                    self._ensure_supplier_on_product(mapped_id, supplier_id, invoice_line.precio_unitario)
-                if not force_hitl:
-                    return mapped_id
+            accepted = _accept_explicit_product(mapped_id)
+            if accepted is not None:
+                return accepted
         # 2b) Coincidencia parcial en supplierinfo si hay proveedor
         mapped_partial = self.get_mapped_product_id(getattr(invoice_line, "detalle", None), supplier_id, partial=True)
         if mapped_partial is not None:
-            if _product_has_supplier(mapped_partial):
-                if supplier_id is not None:
-                    self._ensure_supplier_on_product(mapped_partial, supplier_id, invoice_line.precio_unitario)
-                if not force_hitl:
-                    return mapped_partial
+            accepted = _accept_explicit_product(mapped_partial)
+            if accepted is not None:
+                return accepted
 
         candidates = self.get_product_candidates(
             getattr(invoice_line, "detalle", None),
@@ -1729,22 +1790,147 @@ class OdooConnectionManager:
 
     def _resolve_product_by_default_code(self, default_code: str, supplier_id: Optional[int] = None) -> Optional[int]:
         """Busca product_id por default_code, opcionalmente filtrando por supplier_id."""
-        if not default_code:
+        raw_value = default_code
+        default_code = self._sanitize_default_code(default_code)
+        if not default_code and not raw_value:
             return None
-        domain: list = [["default_code", "=", default_code]]
+        base_domain: list | None = [["default_code", "=", default_code]] if default_code else None
+        barcode_domain: list | None = [["barcode", "=", default_code]] if default_code else None
+        raw_name = str(raw_value).strip() if raw_value is not None else ""
+        raw_name = raw_name.strip("`'\"").strip()
+        name_domain: list | None = [["name", "ilike", raw_name]] if raw_name and any(ch.isspace() for ch in raw_name) else None
+
+        def _search(domain: list | None) -> Optional[int]:
+            if not domain:
+                return None
+            try:
+                ids = self._execute_kw(
+                    "product.product",
+                    "search",
+                    [domain],
+                    {"limit": 1},
+                )
+                if ids:
+                    logger.info("SKU resolve: product.product domain=%s -> %s", domain, ids)
+                    return self._normalize_id(ids[0])
+            except Exception as exc:
+                logger.warning("No se pudo resolver product.product con dominio %s: %s", domain, exc)
+            return None
+
+        def _search_unique(domain: list | None) -> Optional[int]:
+            if not domain:
+                return None
+            try:
+                ids = self._execute_kw(
+                    "product.product",
+                    "search",
+                    [domain],
+                    {"limit": 2},
+                )
+                if len(ids) == 1:
+                    logger.info("SKU resolve (unique): product.product domain=%s -> %s", domain, ids)
+                    return self._normalize_id(ids[0])
+                if len(ids) > 1:
+                    logger.warning("Dominio %s devolvió múltiples productos; se omite.", domain)
+            except Exception as exc:
+                logger.warning("No se pudo resolver product.product con dominio %s: %s", domain, exc)
+            return None
+
+        def _search_template(domain: list | None) -> Optional[int]:
+            if not domain:
+                return None
+            try:
+                ids = self._execute_kw(
+                    "product.template",
+                    "search",
+                    [domain],
+                    {"limit": 1},
+                )
+                if ids:
+                    logger.info("SKU resolve: product.template domain=%s -> %s", domain, ids)
+                    return self._normalize_id(ids[0])
+            except Exception as exc:
+                logger.warning("No se pudo resolver product.template con dominio %s: %s", domain, exc)
+            return None
+
+        def _product_from_template(template_id: int) -> Optional[int]:
+            try:
+                ids = self._execute_kw(
+                    "product.product",
+                    "search",
+                    [[["product_tmpl_id", "=", int(template_id)]]],
+                    {"limit": 1},
+                )
+                if ids:
+                    logger.info("SKU resolve: product.product from template=%s -> %s", template_id, ids)
+                    return self._normalize_id(ids[0])
+            except Exception as exc:
+                logger.warning("No se pudo resolver product.product para template %s: %s", template_id, exc)
+            return None
+
+        # 1) Intento filtrado por proveedor si hay supplier_id (default_code / barcode).
         if supplier_id is not None:
-            domain = ["&", ["seller_ids.partner_id", "=", int(supplier_id)], domain]
-        try:
-            ids = self._execute_kw(
-                "product.product",
-                "search",
-                [domain],
-                {"limit": 1},
-            )
-            if ids:
-                return self._normalize_id(ids[0])
-        except Exception as exc:
-            logger.warning("No se pudo resolver default_code %s: %s", default_code, exc)
+            if base_domain:
+                supplier_domain = ["&", ["seller_ids.partner_id", "=", int(supplier_id)], base_domain]
+                found = _search(supplier_domain)
+                if found is not None:
+                    return found
+            if barcode_domain:
+                supplier_barcode = ["&", ["seller_ids.partner_id", "=", int(supplier_id)], barcode_domain]
+                found = _search(supplier_barcode)
+                if found is not None:
+                    return found
+
+        # 2) Fallback global (sin filtrar por proveedor).
+        found = _search(base_domain)
+        if found is not None:
+            return found
+        found = _search(barcode_domain)
+        if found is not None:
+            return found
+
+        # 3) Fallback adicional: buscar en product.template (default_code / barcode) y resolver variante.
+        if supplier_id is not None:
+            if base_domain:
+                template_domain = ["&", ["seller_ids.partner_id", "=", int(supplier_id)], base_domain]
+                template_id = _search_template(template_domain)
+                if template_id is not None:
+                    product_id = _product_from_template(template_id)
+                    if product_id is not None:
+                        return product_id
+            if barcode_domain:
+                template_barcode = ["&", ["seller_ids.partner_id", "=", int(supplier_id)], barcode_domain]
+                template_id = _search_template(template_barcode)
+                if template_id is not None:
+                    product_id = _product_from_template(template_id)
+                    if product_id is not None:
+                        return product_id
+
+        template_id = _search_template(base_domain)
+        if template_id is not None:
+            product_id = _product_from_template(template_id)
+            if product_id is not None:
+                return product_id
+        template_id = _search_template(barcode_domain)
+        if template_id is not None:
+            product_id = _product_from_template(template_id)
+            if product_id is not None:
+                return product_id
+
+        # 4) Último fallback: nombre exacto/ilike cuando el input parece nombre (con espacios).
+        if supplier_id is not None:
+            supplier_name_domain = ["&", ["seller_ids.partner_id", "=", int(supplier_id)], name_domain] if name_domain else None
+            found = _search_unique(supplier_name_domain)
+            if found is not None:
+                return found
+        found = _search_unique(name_domain)
+        if found is not None:
+            return found
+        template_id = _search_template(name_domain)
+        if template_id is not None:
+            product_id = _product_from_template(template_id)
+            if product_id is not None:
+                return product_id
         return None
 
     def map_product_decision(self, invoice_product_name: str, odoo_product_id: Optional[int], supplier_id: int, default_code: Optional[str] = None) -> None:
@@ -1753,6 +1939,7 @@ class OdooConnectionManager:
             raise ValueError("invoice_product_name es requerido para mapear el producto.")
         product_id = self._normalize_id(odoo_product_id) if odoo_product_id is not None else None
         supplier_id_norm = self._normalize_id(supplier_id)
+        default_code = self._sanitize_default_code(default_code)
         if product_id is None and default_code:
             product_id = self._resolve_product_by_default_code(default_code, supplier_id_norm)
         if product_id is None or supplier_id_norm is None:
