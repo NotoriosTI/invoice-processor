@@ -24,10 +24,10 @@ DEFAULT_INVOICE_PATH = DATA_PATH / "factura.jpg"
 
 class Settings:
     def __init__(self):
-        self.odoo_url = require_config("ODOO_TEST_URL")
-        self.odoo_db = require_config("ODOO_TEST_DB")
-        self.odoo_username = require_config("ODOO_TEST_USERNAME")
-        self.odoo_password = require_config("ODOO_TEST_PASSWORD")
+        self.odoo_url = require_config("ODOO_PROD_URL")
+        self.odoo_db = require_config("ODOO_PROD_DB")
+        self.odoo_username = require_config("ODOO_PROD_USERNAME")
+        self.odoo_password = require_config("ODOO_PROD_PASSWORD")
         self.openai_api_key = require_config("OPENAI_API_KEY")
         self.llm_model = get_config("LLM_MODEL", "gpt-5.2")
         self.embedding_model = get_config("EMBEDDING_MODEL", "text-embedding-3-small")
@@ -36,7 +36,9 @@ class Settings:
         self.slack_debug_logs = get_config("SLACK_DEBUG_LOGS", False)
         self.data_path = DATA_PATH
         self.default_invoice_path = DEFAULT_INVOICE_PATH
-        self.allowed_users_file = get_config("SLACK_ALLOWED_USERS_FILE", "config/allowed_users_config.yaml")
+        self.allowed_users_file = get_config(
+            "SLACK_ALLOWED_USERS_FILE", "config/allowed_users_config.yaml"
+        )
         # Impuestos de compra por defecto (lista de IDs) si una línea no trae impuestos.
         self.default_purchase_tax_ids = get_config("DEFAULT_PURCHASE_TAX_IDS", "")
         # LangSmith tracing (solo variables LANGSMITH_*)
@@ -63,7 +65,10 @@ class Settings:
             os.environ.setdefault("LANGSMITH_PROJECT", str(self.langsmith_project))
             os.environ.setdefault("LANGCHAIN_PROJECT", str(self.langsmith_project))
         if self.langsmith_project_id:
-            os.environ.setdefault("LANGSMITH_PROJECT_ID", str(self.langsmith_project_id))
+            os.environ.setdefault(
+                "LANGSMITH_PROJECT_ID", str(self.langsmith_project_id)
+            )
+
 
 def load_allowed_users():
     settings = get_settings()
@@ -78,7 +83,9 @@ def load_allowed_users():
     users: List[Dict[str, str]] = []
     for entry in users_raw or []:
         if not isinstance(entry, dict):
-            logging.warning("Entrada de usuario inválida (no es dict), se ignora: %s", entry)
+            logging.warning(
+                "Entrada de usuario inválida (no es dict), se ignora: %s", entry
+            )
             continue
         uid = entry.get("id")
         name = entry.get("name", "")
@@ -91,11 +98,13 @@ def load_allowed_users():
         "users": users,
     }
 
+
 def is_user_allowed(user_id: str) -> bool:
     info = load_allowed_users()
     if not info.get("enabled"):
         return False
     return any(user_id == u.get("id") for u in info.get("users", []))
+
 
 def get_settings() -> Settings:
     return Settings()
