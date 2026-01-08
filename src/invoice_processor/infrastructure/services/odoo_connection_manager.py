@@ -2226,136 +2226,234 @@ class OdooConnectionManager:
         return order
     
     def confirm_order_receipt(self, order: dict, qty_by_product: Dict[int, float] | None = None) -> None:
-        """Confirma la recepcion de pickings asociados a la orden, separando destinos según etiquetas."""
+        """Confirma la recepcion de pickings asociados a la orden, ruteando segun prefijo de SKU."""
         picking_ids = self._normalize_id_list(order.get("picking_ids", []))
         if not picking_ids:
             return
-        dest_mp_me = self._get_location_id_by_name("JS/Stock/Materia prima y Envases")
+        dest_mp_me = self._get_location_id_by_name("JS/Stock/Materia Prima y Envases")
         dest_pt = self._get_location_id_by_name("JS/Stock")
+        if dest_mp_me is None:
+            raise RuntimeError(
+                "No se encontro la ubicacion 'JS/Stock/Materia Prima y Envases' en Odoo."
+            )
+        if dest_pt is None:
+            raise RuntimeError("No se encontro la ubicacion 'JS/Stock' en Odoo.")
         qty_by_product = qty_by_product or {}
 
-        def _tag_names(tag_ids: List[int]) -> set[str]:
-            names: set[str] = set()
-            missing: List[int] = []
-            for tid in tag_ids or []:
-                if tid in self._tag_cache:
-                    if self._tag_cache[tid]:
-                        names.add(self._tag_cache[tid])
-                else:
-                    missing.append(tid)
-            if missing:
-                try:
-                    records = self._execute_kw(
-                        "product.tag",
-                        "read",
-                        [missing],
-                        {"fields": ["name"]},
-                    )
-                    for rec in records:
-                        tid = self._normalize_id(rec.get("id"))
-                        tname = rec.get("name")
-                        self._tag_cache[tid] = tname
-                        if tname:
-                            names.add(tname)
-                except Exception as exc:
-                    logger.warning("No se pudieron leer etiquetas %s: %s", missing, exc)
-            return names
-
-        def _target_location(prod_id: Optional[int], tag_ids: List[int]) -> Optional[int]:
-            tag_names = _tag_names(tag_ids)
-            if {"MP", "ME"} & tag_names:
-                return dest_mp_me
-            if "PT" in tag_names:
-                return dest_pt
-            return None
-
-        # Detectar si quantity_done existe en stock.move
-        has_move_qty_done: bool = False
+        has_move_qty_done = False
         try:
-            move_fields = self._execute_kw("stock.move", "fields_get", [], {"attributes": ["type"]})
+            move_fields = self._execute_kw(
+                "stock.move", "fields_get", [], {"attributes": ["type"]}
+            )
             has_move_qty_done = "quantity_done" in move_fields
         except Exception:
             has_move_qty_done = False
-
-        order_lines = self.read_order_lines(order.get("order_line", []))
 
         pickings = self._execute_kw(
             "stock.picking",
             "read",
             [picking_ids],
-            {"fields": ["id", "state", "move_ids_without_package"]},
+            {
+                "fields": [
+                    "id",
+                    "state",
+                    "move_ids_without_package",
+                    "move_ids",
+                    "location_id",
+                    "location_dest_id",
+                    "picking_type_id",
+                    "partner_id",
+                    "origin",
+                    "company_id",
+                    "move_type",
+                    "purchase_id",
+                ]
+            },
         )
+        active_pickings = [p for p in pickings if p.get("state") != "cancel"]
+        if not active_pickings:
+            return
 
-        # Cache de tags de productos si está disponible
-        product_ids_all: List[int] = []
-        for line in order_lines:
-            pid = line.get("product_id")
-            if pid:
-                product_ids_all.append(pid)
-        tag_by_product_full = self._product_tags_for_ids(product_ids_all)
+        picking_moves: Dict[int, List[dict]] = {}
+        product_ids: set[int] = set()
 
-        for picking in pickings:
-            # Confirmar picking si es necesario y el método existe
+        for picking in active_pickings:
             try:
                 self._execute_kw("stock.picking", "action_confirm", [[picking.get("id")]])
             except Exception:
                 pass
-            move_ids = self._normalize_id_list(picking.get("move_ids_without_package", []))
+
+            move_ids = self._normalize_id_list(
+                picking.get("move_ids_without_package") or picking.get("move_ids") or []
+            )
             if not move_ids:
                 continue
             moves = self._execute_kw(
                 "stock.move",
                 "read",
                 [move_ids],
-                {"fields": ["id", "product_id", "location_id", "location_dest_id", "product_uom_qty", "move_line_ids"]},
+                {
+                    "fields": [
+                        "id",
+                        "product_id",
+                        "location_id",
+                        "location_dest_id",
+                        "product_uom_qty",
+                        "move_line_ids",
+                    ]
+                },
             )
-            groups: Dict[Optional[int], List[dict]] = {}
-            for move in moves:
-                prod_id = move.get("product_id", [None])[0] if move.get("product_id") else None
-                tags = tag_by_product_full.get(self._normalize_id(prod_id), [])
-                target_loc = _target_location(prod_id, tags)
-                groups.setdefault(target_loc, []).append(move)
+            picking_id = self._normalize_id(picking.get("id"))
+            if picking_id is not None:
+                picking_moves[picking_id] = moves
+            for move in moves or []:
+                prod_id = self._normalize_id(move.get("product_id"))
+                if prod_id is not None:
+                    product_ids.add(prod_id)
 
-            for target_loc, move_group in groups.items():
-                if not move_group:
+        product_skus: Dict[int, Optional[str]] = {}
+        if product_ids:
+            products = self._execute_kw(
+                "product.product",
+                "read",
+                [list(product_ids)],
+                {"fields": ["id", "default_code"]},
+            )
+            for product in products or []:
+                prod_id = self._normalize_id(product.get("id"))
+                if prod_id is not None:
+                    product_skus[prod_id] = product.get("default_code")
+
+        pickings_to_validate: Dict[int, List[dict]] = {}
+
+        for picking in active_pickings:
+            picking_id = self._normalize_id(picking.get("id"))
+            if picking_id is None:
+                continue
+            moves = picking_moves.get(picking_id, [])
+            if not moves:
+                continue
+
+            moves_by_target: Dict[int, List[dict]] = {}
+            for mv in moves:
+                prod_id = self._normalize_id(mv.get("product_id"))
+                sku_raw = product_skus.get(prod_id)
+                sku_norm = self._sanitize_default_code(sku_raw) if sku_raw else None
+                if not sku_norm:
+                    logger.warning(
+                        "Producto %s sin SKU; se usara destino JS/Stock.", prod_id
+                    )
+                    target_loc = dest_pt
+                elif sku_norm.startswith(("MP", "ME")):
+                    target_loc = dest_mp_me
+                else:
+                    target_loc = dest_pt
+                moves_by_target.setdefault(target_loc, []).append(mv)
+
+            if not moves_by_target:
+                continue
+
+            original_dest = self._normalize_id(picking.get("location_dest_id"))
+            if original_dest in moves_by_target:
+                base_loc = original_dest
+            elif dest_pt in moves_by_target:
+                base_loc = dest_pt
+            else:
+                base_loc = next(iter(moves_by_target.keys()))
+
+            target_pickings: Dict[int, int] = {base_loc: picking_id}
+
+            for target_loc, move_group in moves_by_target.items():
+                if target_loc == base_loc:
                     continue
-                move_ids_group = [mv["id"] for mv in move_group if mv.get("id")]
-                move_line_ids: List[int] = []
+                payload = {
+                    "picking_type_id": self._normalize_id(picking.get("picking_type_id")),
+                    "location_id": self._normalize_id(picking.get("location_id")),
+                    "location_dest_id": target_loc,
+                    "origin": picking.get("origin"),
+                    "partner_id": self._normalize_id(picking.get("partner_id")),
+                    "company_id": self._normalize_id(picking.get("company_id")),
+                    "move_type": picking.get("move_type"),
+                    "purchase_id": self._normalize_id(picking.get("purchase_id")),
+                }
+                payload = {k: v for k, v in payload.items() if v not in (None, False, "")}
+                new_picking_id = self._execute_kw(
+                    "stock.picking",
+                    "create",
+                    [[payload]],
+                )
+                target_pickings[target_loc] = self._normalize_id(new_picking_id)
+
+            if base_loc != original_dest:
+                try:
+                    self._execute_kw(
+                        "stock.picking",
+                        "write",
+                        [[picking_id], {"location_dest_id": base_loc}],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "No se pudo actualizar ubicacion destino del picking %s: %s",
+                        picking_id,
+                        exc,
+                    )
+
+            for target_loc, move_group in moves_by_target.items():
+                target_picking_id = target_pickings.get(target_loc)
+                if target_picking_id is None:
+                    continue
+                pickings_to_validate.setdefault(target_picking_id, []).extend(move_group)
+
                 for mv in move_group:
-                    move_line_ids.extend(self._normalize_id_list(mv.get("move_line_ids", [])))
+                    mv_id = mv.get("id")
+                    prod_id = self._normalize_id(mv.get("product_id"))
+                    if mv_id:
+                        try:
+                            self._execute_kw(
+                                "stock.move",
+                                "write",
+                                [[mv_id], {"location_dest_id": target_loc}],
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "No se pudo actualizar destino de recepción para move %s: %s",
+                                mv_id,
+                                exc,
+                            )
+                        if target_picking_id != picking_id:
+                            try:
+                                self._execute_kw(
+                                    "stock.move",
+                                    "write",
+                                    [[mv_id], {"picking_id": target_picking_id}],
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "No se pudo mover el move %s al picking %s: %s",
+                                    mv_id,
+                                    target_picking_id,
+                                    exc,
+                                )
 
-                # Si no hay ubicación destino para el grupo, registrar seguimiento y no cambiar destino.
-                if target_loc is None:
-                    logger.warning("No se pudo resolver ubicación destino para moves %s; se requiere intervención manual.", move_ids_group)
-
-                # Actualizar destino en moves y move lines si aplica.
-                if target_loc:
-                    try:
-                        self._execute_kw(
-                            "stock.move",
-                            "write",
-                            [move_ids_group, {"location_dest_id": target_loc}],
-                        )
-                    except Exception as exc:
-                        logger.warning("No se pudo actualizar destino de recepción para moves %s: %s", move_ids_group, exc)
-                    if move_line_ids:
+                    line_ids_mv = self._normalize_id_list(mv.get("move_line_ids", []))
+                    if line_ids_mv:
                         try:
                             self._execute_kw(
                                 "stock.move.line",
                                 "write",
-                                [move_line_ids, {"location_dest_id": target_loc}],
+                                [line_ids_mv, {"location_dest_id": target_loc}],
                             )
                         except Exception as exc:
-                            logger.warning("No se pudo actualizar destino en move lines %s: %s", move_line_ids, exc)
+                            logger.warning(
+                                "No se pudo actualizar destino en move lines %s: %s",
+                                line_ids_mv,
+                                exc,
+                            )
 
-                # Ajustar quantities a la cantidad de factura si está disponible; si no, usar planificada.
-                for mv in move_group:
-                    mv_id = mv.get("id")
-                    prod_raw = mv.get("product_id", [None])[0] if mv.get("product_id") else None
-                    pid = self._normalize_id(prod_raw)
                     qty_planned = mv.get("product_uom_qty") or 0.0
-                    qty_invoice = qty_by_product.get(pid) if pid is not None else None
+                    qty_invoice = qty_by_product.get(prod_id) if prod_id is not None else None
                     qty_to_set = qty_invoice if qty_invoice is not None else qty_planned
+
                     if has_move_qty_done and mv_id and qty_to_set:
                         try:
                             self._execute_kw(
@@ -2364,55 +2462,63 @@ class OdooConnectionManager:
                                 [[mv_id], {"quantity_done": qty_to_set}],
                             )
                         except Exception as exc:
-                            logger.warning("No se pudo setear quantity_done para move %s: %s", mv_id, exc)
-                    # Ajustar/crear move lines con qty_done
-                    line_ids_mv = self._normalize_id_list(mv.get("move_line_ids", []))
+                            logger.warning(
+                                "No se pudo setear quantity_done para move %s: %s",
+                                mv_id,
+                                exc,
+                            )
+
                     if line_ids_mv and qty_to_set:
                         try:
-                            move_lines = self._execute_kw(
+                            self._execute_kw(
                                 "stock.move.line",
-                                "read",
-                                [line_ids_mv],
-                                {"fields": ["id", "qty_done"]},
+                                "write",
+                                [line_ids_mv, {"qty_done": qty_to_set}],
                             )
-                            for ml in move_lines:
-                                if not ml.get("id"):
-                                    continue
-                                try:
-                                    self._execute_kw(
-                                        "stock.move.line",
-                                        "write",
-                                        [[ml["id"]], {"qty_done": qty_to_set}],
-                                    )
-                                except Exception as exc:
-                                    logger.warning("No se pudo setear qty_done para move line %s: %s", ml["id"], exc)
                         except Exception as exc:
-                            logger.warning("No se pudieron leer move lines %s: %s", line_ids_mv, exc)
-                    if (not line_ids_mv) and qty_to_set and mv_id:
+                            logger.warning(
+                                "No se pudo setear qty_done para move lines %s: %s",
+                                line_ids_mv,
+                                exc,
+                            )
+                    elif (not line_ids_mv) and qty_to_set and mv_id:
                         try:
                             src_loc = self._normalize_id(mv.get("location_id"))
-                            dest_loc_line = target_loc if target_loc else self._normalize_id(mv.get("location_dest_id"))
+                            if src_loc is None:
+                                raise RuntimeError(
+                                    f"No se pudo resolver la ubicacion origen para move {mv_id}."
+                                )
                             self._execute_kw(
                                 "stock.move.line",
                                 "create",
                                 [[
                                     {
                                         "move_id": mv_id,
-                                        "product_id": pid,
+                                        "product_id": prod_id,
                                         "qty_done": qty_to_set,
                                         "location_id": src_loc,
-                                        "location_dest_id": dest_loc_line,
+                                        "location_dest_id": target_loc,
                                     }
                                 ]],
                             )
                         except Exception as exc:
-                            logger.warning("No se pudo crear move line para move %s: %s", mv_id, exc)
+                            logger.warning(
+                                "No se pudo crear move line para move %s: %s", mv_id, exc
+                            )
 
-                try:
-                    # Validar siempre el picking para asegurar qty_done en move lines
-                    self._execute_kw("stock.picking", "button_validate", [[picking.get("id")]])
-                except Exception as exc:
-                    logger.warning("No se pudo validar moves %s: %s", move_ids_group, exc)
+        for picking_id, moves in pickings_to_validate.items():
+            if not moves:
+                continue
+            try:
+                self._execute_kw("stock.picking", "action_confirm", [[picking_id]])
+            except Exception:
+                pass
+            try:
+                self._execute_kw("stock.picking", "button_validate", [[picking_id]])
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo validar picking %s: %s", picking_id, exc
+                )
     
     def create_invoice_for_order(self, order_id: int) -> None:
         """Genera la factura desde la orden de compra."""

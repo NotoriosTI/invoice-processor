@@ -8,6 +8,7 @@ from ..tools.odoo_tools import (
     split_purchase_line,
     update_line_quantity,
     finalize_invoice_workflow,
+    receive_order_by_sku_prefix,
 )
 
 tools = [
@@ -17,6 +18,7 @@ tools = [
     split_purchase_line,
     update_line_quantity,
     finalize_invoice_workflow,
+    receive_order_by_sku_prefix,
 ]
 checkpointer = MemorySaver()
 reader_tools = [parse_invoice_image]

@@ -44,6 +44,10 @@ class FinalizeInvoiceWorkflowArgs(BaseModel):
     )
 
 
+class ReceiveOrderBySkuPrefixArgs(BaseModel):
+    po_name: str = Field(..., description="Nombre de la Orden de Compra (ej: PO00123).")
+
+
 def _get_unique_order_by_name(po_name: str) -> dict:
     po_name = (po_name or "").strip()
     if not po_name:
@@ -63,6 +67,82 @@ def _get_unique_order_by_name(po_name: str) -> dict:
     if not order:
         raise ValueError(f"No se pudo leer la OC '{po_name}'.")
     return order
+
+
+def _resolve_location_id_by_complete_name(name: str) -> int:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("El nombre de la ubicacion es requerido.")
+    location_ids = odoo_manager._execute_kw(
+        "stock.location",
+        "search",
+        [[["complete_name", "ilike", name]]],
+        {"limit": 20},
+    )
+    location_ids = odoo_manager._normalize_id_list(location_ids or [])
+    if not location_ids:
+        location_ids = odoo_manager._execute_kw(
+            "stock.location",
+            "search",
+            [[["name", "ilike", name]]],
+            {"limit": 20},
+        )
+        location_ids = odoo_manager._normalize_id_list(location_ids or [])
+    if not location_ids:
+        raise ValueError(f"No se encontro la ubicacion '{name}'.")
+
+    locations = odoo_manager._execute_kw(
+        "stock.location",
+        "read",
+        [location_ids],
+        {"fields": ["id", "complete_name", "name"]},
+    )
+    target = name.lower()
+    matches = []
+    for loc in locations or []:
+        complete = (loc.get("complete_name") or "").strip().lower()
+        base = (loc.get("name") or "").strip().lower()
+        if complete == target or base == target:
+            matches.append(loc)
+    if not matches:
+        candidates = ", ".join(
+            sorted(
+                {
+                    (loc.get("complete_name") or loc.get("name") or "").strip()
+                    for loc in locations
+                    if (loc.get("complete_name") or loc.get("name"))
+                }
+            )
+        )
+        raise ValueError(
+            f"No se encontro coincidencia exacta para la ubicacion '{name}'. "
+            f"Candidatos: {candidates}."
+        )
+    if len(matches) > 1:
+        candidates = ", ".join(
+            sorted(
+                {
+                    (loc.get("complete_name") or loc.get("name") or "").strip()
+                    for loc in matches
+                    if (loc.get("complete_name") or loc.get("name"))
+                }
+            )
+        )
+        raise ValueError(f"Ubicacion ambigua para '{name}': {candidates}.")
+    location_id = odoo_manager._normalize_id(matches[0].get("id"))
+    if location_id is None:
+        raise ValueError(f"No se pudo resolver el ID de la ubicacion '{name}'.")
+    return location_id
+
+
+def _stock_move_has_quantity_done() -> bool:
+    try:
+        move_fields = odoo_manager._execute_kw(
+            "stock.move", "fields_get", [], {"attributes": ["type"]}
+        )
+        return "quantity_done" in move_fields
+    except Exception:
+        return False
 
 
 def _describe_lines(lines: List[dict]) -> str:
@@ -385,4 +465,205 @@ def finalize_invoice_workflow(po_name: str, block_if_line_keyword_present: str |
         logger.exception("Odoo Fault en finalize_invoice_workflow: %s", exc)
         raise RuntimeError(
             f"Odoo devolvio un error en finalize_invoice_workflow: {exc}"
+        ) from exc
+
+
+@tool("receive_order_by_sku_prefix", args_schema=ReceiveOrderBySkuPrefixArgs)
+def receive_order_by_sku_prefix(po_name: str) -> str:
+    """Recepciona la OC y enruta destinos segun prefijo de SKU (MP/ME)."""
+    try:
+        order = _get_unique_order_by_name(po_name)
+        order_name = order.get("name") or po_name
+        if order.get("state") == "cancel":
+            raise ValueError("La OC esta cancelada. No se puede recepcionar.")
+
+        picking_ids = odoo_manager._normalize_id_list(order.get("picking_ids", []))
+        if not picking_ids:
+            return f"OC {order_name}: Sin recepciones pendientes."
+
+        pickings = odoo_manager._execute_kw(
+            "stock.picking",
+            "read",
+            [picking_ids],
+            {"fields": ["id", "name", "state", "move_ids_without_package", "move_ids"]},
+        )
+        active_pickings = [picking for picking in pickings if picking.get("state") != "cancel"]
+        if not active_pickings:
+            return f"OC {order_name}: Sin recepciones pendientes."
+
+        dest_mp_me = _resolve_location_id_by_complete_name(
+            "JS/Stock/Materia Prima y Envases"
+        )
+        dest_stock = _resolve_location_id_by_complete_name("JS/Stock")
+        has_move_qty_done = _stock_move_has_quantity_done()
+
+        picking_moves: dict[int, list[dict]] = {}
+        product_ids: set[int] = set()
+        for picking in active_pickings:
+            move_ids = odoo_manager._normalize_id_list(
+                picking.get("move_ids_without_package") or picking.get("move_ids") or []
+            )
+            moves = []
+            if move_ids:
+                moves = odoo_manager._execute_kw(
+                    "stock.move",
+                    "read",
+                    [move_ids],
+                    {
+                        "fields": [
+                            "id",
+                            "product_id",
+                            "product_uom_qty",
+                            "move_line_ids",
+                            "location_id",
+                            "location_dest_id",
+                        ]
+                    },
+                )
+            picking_id = odoo_manager._normalize_id(picking.get("id"))
+            if picking_id is not None:
+                picking_moves[picking_id] = moves
+            for move in moves or []:
+                prod_id = odoo_manager._normalize_id(move.get("product_id"))
+                if prod_id is not None:
+                    product_ids.add(prod_id)
+
+        product_skus: dict[int, str | None] = {}
+        if product_ids:
+            products = odoo_manager._execute_kw(
+                "product.product",
+                "read",
+                [list(product_ids)],
+                {"fields": ["id", "default_code"]},
+            )
+            for product in products or []:
+                prod_id = odoo_manager._normalize_id(product.get("id"))
+                if prod_id is not None:
+                    product_skus[prod_id] = product.get("default_code")
+
+        totals = {
+            "JS/Stock/Materia Prima y Envases": 0.0,
+            "JS/Stock": 0.0,
+        }
+
+        for picking in active_pickings:
+            picking_id = odoo_manager._normalize_id(picking.get("id"))
+            if picking_id is None:
+                continue
+            picking_name = picking.get("name") or str(picking_id)
+            moves = picking_moves.get(picking_id, [])
+            for move in moves or []:
+                move_id = odoo_manager._normalize_id(move.get("id"))
+                if move_id is None:
+                    continue
+                prod_id = odoo_manager._normalize_id(move.get("product_id"))
+                sku_raw = product_skus.get(prod_id)
+                sku_norm = (
+                    odoo_manager._sanitize_default_code(sku_raw) if sku_raw else None
+                )
+                if not sku_norm:
+                    if prod_id is not None:
+                        logger.warning(
+                            "Producto %s sin SKU; se usara destino JS/Stock.", prod_id
+                        )
+                    else:
+                        logger.warning(
+                            "Move %s sin product_id; se usara destino JS/Stock.", move_id
+                        )
+                    target_loc = dest_stock
+                else:
+                    if sku_norm.startswith(("MP", "ME")):
+                        target_loc = dest_mp_me
+                    else:
+                        target_loc = dest_stock
+
+                qty_to_set = float(move.get("product_uom_qty") or 0.0)
+
+                odoo_manager._execute_kw(
+                    "stock.move",
+                    "write",
+                    [[move_id], {"location_dest_id": target_loc}],
+                )
+
+                move_line_ids = odoo_manager._normalize_id_list(
+                    move.get("move_line_ids") or []
+                )
+                if move_line_ids:
+                    odoo_manager._execute_kw(
+                        "stock.move.line",
+                        "write",
+                        [move_line_ids, {"location_dest_id": target_loc}],
+                    )
+
+                if has_move_qty_done:
+                    if qty_to_set:
+                        odoo_manager._execute_kw(
+                            "stock.move",
+                            "write",
+                            [[move_id], {"quantity_done": qty_to_set}],
+                        )
+                else:
+                    if move_line_ids:
+                        if qty_to_set:
+                            odoo_manager._execute_kw(
+                                "stock.move.line",
+                                "write",
+                                [move_line_ids, {"qty_done": qty_to_set}],
+                            )
+                    elif qty_to_set:
+                        src_loc = odoo_manager._normalize_id(move.get("location_id"))
+                        if src_loc is None:
+                            raise ValueError(
+                                f"No se pudo resolver la ubicacion origen para move {move_id}."
+                            )
+                        odoo_manager._execute_kw(
+                            "stock.move.line",
+                            "create",
+                            [[
+                                {
+                                    "move_id": move_id,
+                                    "product_id": prod_id,
+                                    "qty_done": qty_to_set,
+                                    "location_id": src_loc,
+                                    "location_dest_id": target_loc,
+                                }
+                            ]],
+                        )
+
+                if target_loc == dest_mp_me:
+                    totals["JS/Stock/Materia Prima y Envases"] += qty_to_set
+                else:
+                    totals["JS/Stock"] += qty_to_set
+
+            result = odoo_manager._execute_kw(
+                "stock.picking",
+                "button_validate",
+                [[picking_id]],
+            )
+            if isinstance(result, (dict, list)):
+                raise RuntimeError(
+                    f"Picking {picking_name} requiere intervencion manual (wizard/backorder)."
+                )
+            picking_state = odoo_manager._execute_kw(
+                "stock.picking",
+                "read",
+                [[picking_id]],
+                {"fields": ["state"]},
+            )
+            state = picking_state[0].get("state") if picking_state else None
+            if state != "done":
+                raise RuntimeError(
+                    f"Picking {picking_name} quedo en estado '{state}'. "
+                    "Se requiere intervencion manual."
+                )
+
+        return (
+            f"OC {order_name}: recepcion completada. "
+            f"JS/Stock/Materia Prima y Envases: {totals['JS/Stock/Materia Prima y Envases']}. "
+            f"JS/Stock: {totals['JS/Stock']}."
+        )
+    except xmlrpc.client.Fault as exc:
+        logger.exception("Odoo Fault en receive_order_by_sku_prefix: %s", exc)
+        raise RuntimeError(
+            f"Odoo devolvio un error en receive_order_by_sku_prefix: {exc}"
         ) from exc

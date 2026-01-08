@@ -191,31 +191,64 @@ def _finalize_and_post_order(order: dict) -> str:
         raise RuntimeError("La OC esta cancelada. No se puede continuar.")
 
     odoo_manager.confirm_order_receipt(order)
-    picking_ids = odoo_manager._normalize_id_list(order.get("picking_ids", []))
+    order_name = order.get("name")
+    picking_ids = set(odoo_manager._normalize_id_list(order.get("picking_ids", [])))
+    if order_id is not None:
+        try:
+            ids_by_po = odoo_manager._execute_kw(
+                "stock.picking",
+                "search",
+                [[["purchase_id", "=", order_id]]],
+            )
+            picking_ids.update(odoo_manager._normalize_id_list(ids_by_po or []))
+        except Exception:
+            pass
+    if order_name:
+        try:
+            ids_by_origin = odoo_manager._execute_kw(
+                "stock.picking",
+                "search",
+                [[["origin", "=", order_name]]],
+            )
+            picking_ids.update(odoo_manager._normalize_id_list(ids_by_origin or []))
+        except Exception:
+            pass
+
     picking_summaries = []
     if picking_ids:
         pickings = odoo_manager._execute_kw(
             "stock.picking",
             "read",
-            [picking_ids],
+            [list(picking_ids)],
             {"fields": ["id", "name", "state"]},
+        )
+        pickings = [p for p in pickings if p.get("state") != "cancel"]
+        pickings = sorted(
+            pickings, key=lambda p: (p.get("name") or "", p.get("id") or 0)
         )
         for picking in pickings:
             name = picking.get("name") or str(picking.get("id"))
             state = picking.get("state")
-            picking_summaries.append(f"{name}:{state}")
+            picking_summaries.append((name, state))
             if state != "done":
                 raise RuntimeError(
                     f"Picking {name} quedo en estado '{state}'. Se requiere intervencion manual."
                 )
-    pickings_info = (
-        f" Pickings: {', '.join(picking_summaries)}."
-        if picking_summaries
-        else " Sin pickings."
-    )
-    return (
-        f"OC {order.get('name')}: recepcionada.{pickings_info}"
-    )
+
+    if picking_summaries:
+        if len(picking_summaries) == 1:
+            name, state = picking_summaries[0]
+            pickings_info = f" Recepción realizada: {name} → {state}."
+        else:
+            lines = [
+                f"Recepción {idx} realizada: {name} → {state}."
+                for idx, (name, state) in enumerate(picking_summaries, start=1)
+            ]
+            pickings_info = " " + " ".join(lines)
+    else:
+        pickings_info = " Sin pickings."
+
+    return f"OC {order.get('name')}: recepcionada.{pickings_info}"
 
 
 def _looks_like_sku(value: str) -> bool:
