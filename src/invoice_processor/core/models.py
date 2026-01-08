@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 class InvoiceLine(BaseModel):
     model_config = ConfigDict(extra="forbid")
     detalle: str = Field(..., description="Producto tal como aparece en la factura (DETALLE)")
+    default_code: Optional[str] = Field(
+        default=None, description="SKU/default_code del producto en Odoo (si está disponible)"
+    )
     cantidad: float = Field(..., gt=0, description="Cantidad facturada (CANT)")
     precio_unitario: float = Field(..., description="Precio unitario (P. UNITARIO)")
     subtotal: float = Field(..., description="Total por línea (columna TOTAL junto a P. UNITARIO)")
@@ -93,6 +96,12 @@ class InvoiceResponseModel(BaseModel):
     neto_match: Optional[bool] = None
     iva_match: Optional[bool] = None
     total_match: Optional[bool] = None
+    po_name: Optional[str] = Field(
+        default=None, description="Nombre de la OC asociada al flujo (ej: PO000123)"
+    )
+    po_id: Optional[int] = Field(
+        default=None, description="ID interno de la OC en Odoo"
+    )
     supplier_id: Optional[int] = Field(
         default=None, description="ID de proveedor usado para mapear productos"
     )
@@ -102,6 +111,6 @@ class InvoiceResponseModel(BaseModel):
     supplier_rut: Optional[str] = Field(
         default=None, description="RUT/tax_id del proveedor detectado en la factura"
     )
-    status: Optional[Literal["WAITING_FOR_HUMAN"]] = Field(
+    status: Optional[Literal["WAITING_FOR_HUMAN", "WAITING_FOR_APPROVAL"]] = Field(
         default=None, description="Estado global del flujo de la factura"
     )

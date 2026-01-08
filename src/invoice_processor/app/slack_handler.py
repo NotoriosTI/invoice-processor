@@ -1,6 +1,7 @@
 from pathlib import Path
 from queue import Queue
 import logging
+import re
 import requests
 from langchain_core.messages import SystemMessage, HumanMessage
 from rich.logging import RichHandler
@@ -63,6 +64,7 @@ def run_slack_bot():
     allowed = load_allowed_users()
     message_queue = Queue()
     last_file_by_thread: dict[str, Path] = {}
+    last_status_by_thread: dict[str, str] = {}
     slack_bot = SlackBot(
         app_token=settings.slack_app_token,
         bot_token=settings.slack_bot_token,
@@ -185,6 +187,14 @@ def run_slack_bot():
         # Si no hay texto, usar un mensaje por defecto
         if not incoming_text:
             incoming_text = "Procesa esta factura."
+        last_status = last_status_by_thread.get(user_id)
+        if last_status in {"WAITING_FOR_HUMAN", "WAITING_FOR_APPROVAL"} and _is_affirmative(incoming_text):
+            if last_status == "WAITING_FOR_HUMAN":
+                incoming_text = "Afirmativo"
+            elif last_status == "WAITING_FOR_APPROVAL":
+                incoming_text = "Continuar"
+            logger.info("Respuesta afirmativa normalizada para estado=%s.", last_status)
+
         messages = format_messages(incoming_text, str(file_path), is_new_thread)
 
         try:
@@ -197,15 +207,15 @@ def run_slack_bot():
                 "Ocurrió un error al procesar la factura. Intenta nuevamente más tarde.",
                 timestamp,
             )
-            try:
-                add_reaction(channel, timestamp, "x")
-            except Exception:
-                logger.debug("No se pudo agregar reacción de error al mensaje original.")
             continue
         # Prefiere la respuesta estructurada del modelo si existe; evita la conversación interna.
         response_model: InvoiceResponseModel | None = _coerce_response_model(result)
         if response_model:
             needs_follow_up = bool(response_model.needs_follow_up)
+            if response_model.status:
+                last_status_by_thread[user_id] = response_model.status
+            else:
+                last_status_by_thread.pop(user_id, None)
             if needs_follow_up and response_model.status == "WAITING_FOR_HUMAN" and response_model.products:
                 first = response_model.products[0]
                 supplier_name = getattr(first, "supplier_name", None) or "Desconocido"
@@ -237,6 +247,8 @@ def run_slack_bot():
                         '- Para corregir, indica: *"Cambiar {Producto Factura} por {Nombre Correcto o SKU}"*.',
                     ]
                 )
+            elif needs_follow_up and response_model.status == "WAITING_FOR_APPROVAL":
+                response = response_model.summary
             else:
                 response = response_model.summary
         else:
@@ -244,7 +256,7 @@ def run_slack_bot():
             response = "No se pudo procesar la factura; revisa Odoo manualmente."
             needs_follow_up = True
 
-        # Reacciona en el mensaje original: verde si todo OK y se cerró flujo; rojo + mensaje si hay follow-up.
+        # Reacciona en el mensaje original: verde si todo OK y se cerró flujo; si hay follow-up solo responde.
         if not needs_follow_up:
             try:
                 add_reaction(channel, timestamp, "white_check_mark")
@@ -258,10 +270,6 @@ def run_slack_bot():
                 logger.debug("Respuesta que falló: %s", response)
             continue
         else:
-            try:
-                add_reaction(channel, timestamp, "x")
-            except Exception:
-                logger.debug("No se pudo agregar reacción de error al mensaje original.")
             try:
                 post_message(channel, response, timestamp)
             except Exception as exc:
@@ -368,4 +376,43 @@ def _coerce_response_model(result) -> InvoiceResponseModel | None:
                 pass
     except Exception:
         return None
+
+
+def _normalize_text(text: str) -> str:
+    cleaned = re.sub(r"[^\wáéíóúüñ ]", " ", (text or "").lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_affirmative(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    if normalized in {
+        "si",
+        "sí",
+        "ok",
+        "okay",
+        "okey",
+        "dale",
+        "listo",
+        "afirmativo",
+        "confirmo",
+        "continuar",
+        "continua",
+        "continuo",
+        "vamos",
+        "adelante",
+    }:
+        return True
+    if normalized in {
+        "de acuerdo",
+        "tienes permiso",
+        "tiene permiso",
+        "autorizo",
+        "autorizado",
+        "autorizada",
+    }:
+        return True
+    return False
     return None

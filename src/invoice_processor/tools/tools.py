@@ -10,8 +10,32 @@ class ParseInvoiceArgs(BaseModel):
     image_path: str = Field(..., description="Ruta local del archivo PNG/JPG que contiene la factura")
 
 
+class SplitPlanLineItem(BaseModel):
+    product_search_term: str = Field(
+        ..., description="SKU o nombre del producto para desglosar."
+    )
+    qty: float = Field(..., description="Cantidad para el item desglosado.")
+
+
+class SplitPlanItem(BaseModel):
+    original_line_keyword: str = Field(
+        ..., description="Texto para identificar la línea a desglosar."
+    )
+    new_items: list[SplitPlanLineItem] = Field(
+        ..., description="Items del desglose con product_search_term y qty."
+    )
+
+
 class ProcessInvoiceArgs(BaseModel):
     image_path: str = Field(..., description="Ruta local del archivo a procesar")
+    allow_odoo_write: bool = Field(
+        default=False,
+        description="Si es True, permite escribir en Odoo (crear/editar OC, recepcionar, facturar).",
+    )
+    split_plan: list[SplitPlanItem] | None = Field(
+        default=None,
+        description="Plan de desglose antes de crear la OC. Lista de {original_line_keyword, new_items}.",
+    )
 
 
 class MapProductDecisionArgs(BaseModel):
@@ -35,13 +59,17 @@ def parse_invoice_image(image_path: str) -> InvoiceData:
 
 
 @tool("process_invoice_purchase_flow", args_schema=ProcessInvoiceArgs)
-def process_invoice_purchase_flow(image_path: str) -> InvoiceResponseModel:
+def process_invoice_purchase_flow(
+    image_path: str, allow_odoo_write: bool = False, split_plan: list[SplitPlanItem] | None = None
+) -> InvoiceResponseModel:
     """
     Compara los campos de la factura con los de Odoo. Devuelve coincidencias/diferencias
     en cabecera y por producto. Si el OCR falla, informa al usuario.
+    Si allow_odoo_write es False, no escribe en Odoo y solicita aprobacion.
+    split_plan permite desglosar lineas antes de crear la OC.
     """
     try:
-        return process_invoice_file(image_path)
+        return process_invoice_file(image_path, allow_odoo_write=allow_odoo_write, split_plan=split_plan)
     except ValueError as exc:
         return InvoiceResponseModel(
             summary=f"No se pudo interpretar la factura: {exc}",
@@ -59,7 +87,7 @@ def map_product_decision_tool(
     supplier_name: str | None = None,
     supplier_rut: str | None = None,
 ) -> str:
-    """Registra el mapeo en `product.supplierinfo` (memoria de mapeo). No modifica `purchase.order`."""
+    """Registra el mapeo en `product.supplierinfo` (memoria de mapeo) usando odoo_product_id o default_code (SKU). No modifica `purchase.order`."""
     if supplier_id is None:
         supplier_id = odoo_manager._resolve_supplier_id(None, supplier_name, supplier_rut)
     if supplier_id is None:

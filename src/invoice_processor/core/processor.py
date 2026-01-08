@@ -1,5 +1,7 @@
 from typing import Dict, List, Optional
+from pathlib import Path
 import logging
+import math
 import os
 import re
 import unicodedata
@@ -53,6 +55,323 @@ def _apply_line_discounts(invoice: InvoiceData) -> InvoiceData:
     return invoice.model_copy(update={"lines": adjusted_lines})
 
 
+def _fmt_number(value: float | None) -> str:
+    if value is None:
+        return "N/D"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(num - round(num)) < 0.01:
+        return f"{int(round(num)):,}".replace(",", ".")
+    return f"{num:.2f}"
+
+
+def _format_invoice_overview(
+    invoice: InvoiceData,
+    image_path: str | None,
+    supplier_id: Optional[int] = None,
+    line_skus: Optional[List[Optional[str]]] = None,
+) -> str:
+    filename = Path(image_path).name if image_path else "factura"
+    lines: List[str] = [
+        f"Leí la **{filename}** (solo tabla) y comparé en **modo lectura** contra Odoo.",
+        "",
+        "**Proveedor (factura → Odoo)**",
+        f"- {invoice.supplier_name or 'N/D'} — RUT **{invoice.supplier_rut or 'N/D'}**",
+    ]
+    if supplier_id is not None:
+        lines.append(f"- Odoo: **supplier_id={supplier_id}** (resuelto OK)")
+    lines.extend(
+        [
+            "",
+            "**Totales factura**",
+            f"- Descuento global: **{_fmt_number(getattr(invoice, 'descuento_global', 0.0))}**",
+            f"- Neto: **{_fmt_number(invoice.neto)}**",
+            f"- IVA 19%: **{_fmt_number(invoice.iva_19)}**",
+            f"- Total: **{_fmt_number(invoice.total)}**",
+            "",
+            "**Líneas (Factura → Producto Odoo propuesto (SKU))**",
+        ]
+    )
+    for idx, line in enumerate(invoice.lines, start=1):
+        sku = None
+        if line_skus and idx - 1 < len(line_skus):
+            sku = line_skus[idx - 1]
+        sku_label = sku if sku else "N/A"
+        line_text = (
+            f"{idx}) {line.detalle} → **{sku_label}** "
+            f"(Cant {_fmt_number(line.cantidad)}, P.Unit {_fmt_number(line.precio_unitario)}, "
+            f"Subtotal {_fmt_number(line.subtotal)})"
+        )
+        if not sku:
+            line_text = f"{line_text} ← **sin mapeo**"
+        lines.append(line_text)
+    return "\n".join(lines)
+
+
+def _build_pre_approval_summary(
+    invoice: InvoiceData,
+    image_path: str | None,
+    order: Optional[dict],
+    supplier_id: Optional[int] = None,
+    issue_count: int = 0,
+    header_mismatch: bool = False,
+    ocr_warning: Optional[str] = None,
+    line_skus: Optional[List[Optional[str]]] = None,
+) -> str:
+    parts = [
+        _format_invoice_overview(
+            invoice, image_path, supplier_id=supplier_id, line_skus=line_skus
+        ),
+        "",
+        "**Riesgo/impacto**",
+    ]
+    if order:
+        order_name = order.get("name") or "OC"
+        order_state = order.get("state") or "desconocido"
+        parts.append(f"- OC detectada: **{order_name}** (estado {order_state}).")
+    else:
+        parts.append(
+            "- **No se encontró una OC coincidente**; si continuamos, el flujo "
+            "**creará una nueva OC** y luego **recepcionará** (sin tocar facturas)."
+        )
+    if issue_count:
+        parts.append(f"- Hay **{issue_count}** línea(s) con diferencias vs Odoo.")
+    if header_mismatch:
+        parts.append("- Cabecera no coincide con la factura.")
+    if ocr_warning:
+        parts.append(f"- Advertencia OCR: {ocr_warning}.")
+    missing_details = [
+        line.detalle
+        for idx, line in enumerate(invoice.lines)
+        if not (line_skus and idx < len(line_skus) and line_skus[idx])
+    ]
+    parts.extend(
+        [
+            "",
+            "Antes de escribir en Odoo:",
+        ]
+    )
+    if missing_details:
+        missing_label = ", ".join(f"\"{detalle}\"" for detalle in missing_details)
+        example_detail = missing_details[0]
+        parts.append(
+            f"1) Para {missing_label}, dime el **SKU** o el producto correcto en Odoo "
+            f"(ej: \"Cambiar {example_detail} por MP0XX\")."
+        )
+        parts.append("2) Con eso listo, **confirmo y continúo** (crear OC + recepcionar)?")
+    else:
+        parts.append("1) Si todo está correcto, **confirmo y continúo** (crear OC + recepcionar)?")
+    return "\n".join(parts)
+
+
+def _resolve_invoice_type_field() -> str:
+    try:
+        fields = odoo_manager._execute_kw(
+            "account.move", "fields_get", [], {"attributes": ["type"]}
+        )
+    except Exception:
+        return "move_type"
+    if "move_type" in fields:
+        return "move_type"
+    if "type" in fields:
+        return "type"
+    return "move_type"
+
+
+def _finalize_and_post_order(order: dict) -> str:
+    order_id = odoo_manager._normalize_id(order.get("id"))
+    if order_id is None:
+        raise RuntimeError("No se pudo resolver el id de la OC.")
+    order_state = order.get("state")
+    if order_state in {"draft", "sent"}:
+        order = odoo_manager.confirm_purchase_order(order_id)
+    elif order_state == "cancel":
+        raise RuntimeError("La OC esta cancelada. No se puede continuar.")
+
+    odoo_manager.confirm_order_receipt(order)
+    picking_ids = odoo_manager._normalize_id_list(order.get("picking_ids", []))
+    picking_summaries = []
+    if picking_ids:
+        pickings = odoo_manager._execute_kw(
+            "stock.picking",
+            "read",
+            [picking_ids],
+            {"fields": ["id", "name", "state"]},
+        )
+        for picking in pickings:
+            name = picking.get("name") or str(picking.get("id"))
+            state = picking.get("state")
+            picking_summaries.append(f"{name}:{state}")
+            if state != "done":
+                raise RuntimeError(
+                    f"Picking {name} quedo en estado '{state}'. Se requiere intervencion manual."
+                )
+    pickings_info = (
+        f" Pickings: {', '.join(picking_summaries)}."
+        if picking_summaries
+        else " Sin pickings."
+    )
+    return (
+        f"OC {order.get('name')}: recepcionada.{pickings_info}"
+    )
+
+
+def _looks_like_sku(value: str) -> bool:
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", value or "")
+    return bool(cleaned) and (" " not in (value or ""))
+
+
+def _resolve_product_for_split(term: str, supplier_id: Optional[int]) -> dict:
+    term_norm = (term or "").strip()
+    if not term_norm:
+        raise ValueError("product_search_term no puede estar vacio.")
+    raw = term_norm.strip("`'\"").strip()
+    sku_hint = raw
+    if raw.lower().startswith("sku:"):
+        sku_hint = raw.split(":", 1)[1].strip()
+    product_id = None
+    if sku_hint and _looks_like_sku(sku_hint):
+        product_id = odoo_manager._resolve_product_by_default_code(sku_hint, supplier_id)
+    if product_id:
+        recs = odoo_manager._execute_kw(
+            "product.product",
+            "read",
+            [[int(product_id)]],
+            {"fields": ["id", "name", "default_code"]},
+        )
+        if recs:
+            return recs[0]
+
+    def _search_by_name(with_supplier: bool) -> List[dict]:
+        domain = [["name", "ilike", raw], ["purchase_ok", "=", True]]
+        if with_supplier and supplier_id is not None:
+            domain.append(["seller_ids.partner_id", "=", int(supplier_id)])
+        return odoo_manager._execute_kw(
+            "product.product",
+            "search_read",
+            [domain],
+            {"fields": ["id", "name", "default_code"], "limit": 5},
+        ) or []
+
+    products = _search_by_name(with_supplier=True)
+    if not products:
+        products = _search_by_name(with_supplier=False)
+    if not products:
+        raise ValueError(f"No se encontro producto para '{term_norm}'.")
+    if len(products) > 1:
+        candidates = []
+        for prod in products:
+            prod_id = odoo_manager._normalize_id(prod.get("id"))
+            name = prod.get("name") or "sin_nombre"
+            sku = prod.get("default_code")
+            sku_label = f" SKU {sku}" if sku else ""
+            candidates.append(f"[{prod_id}] {name}{sku_label}")
+        raise ValueError(
+            f"Busqueda ambigua para '{term_norm}'. Candidatos: {', '.join(candidates)}."
+        )
+    return products[0]
+
+
+def _apply_split_plan(
+    invoice: InvoiceData,
+    split_plan: list[dict],
+    supplier_id: Optional[int],
+) -> tuple[InvoiceData, List[Optional[dict]]]:
+    if not split_plan:
+        return invoice, []
+    def _get_field(obj, name: str):
+        if isinstance(obj, dict):
+            return obj.get(name)
+        return getattr(obj, name, None)
+    lines = list(invoice.lines)
+    explicit_map: List[Optional[dict]] = [None for _ in lines]
+
+    for plan in split_plan:
+        keyword = _get_field(plan, "original_line_keyword")
+        new_items = _get_field(plan, "new_items")
+        keyword_norm = (keyword or "").strip().lower()
+        if not keyword_norm:
+            raise ValueError("original_line_keyword es requerido para el desglose.")
+        if not new_items:
+            raise ValueError(f"new_items vacío para '{keyword}'.")
+
+        matches = [
+            idx
+            for idx, line in enumerate(lines)
+            if keyword_norm in (line.detalle or "").lower()
+        ]
+        if not matches:
+            raise ValueError(f"No se encontro linea que contenga '{keyword}'.")
+        if len(matches) > 1:
+            detalles = "; ".join(
+                f"[{i}] {lines[i].detalle}" for i in matches if i < len(lines)
+            )
+            raise ValueError(
+                f"Se encontraron multiples lineas con '{keyword}': {detalles}."
+            )
+
+        target_idx = matches[0]
+        original_line = lines[target_idx]
+        original_qty = float(original_line.cantidad or 0.0)
+        total_new_qty = 0.0
+        resolved_items: List[dict] = []
+
+        for item in new_items:
+            term = _get_field(item, "product_search_term")
+            qty = _get_field(item, "qty")
+            if qty is None:
+                raise ValueError("Cada item debe incluir qty.")
+            qty_value = float(qty)
+            if qty_value <= 0:
+                raise ValueError("Cada qty en el desglose debe ser > 0.")
+            total_new_qty += qty_value
+            product = _resolve_product_for_split(term, supplier_id)
+            resolved_items.append(
+                {
+                    "qty": qty_value,
+                    "product_id": odoo_manager._normalize_id(product.get("id")),
+                    "name": product.get("name") or term,
+                    "default_code": (
+                        product.get("default_code")
+                        if product.get("default_code") not in (False, None, "")
+                        else None
+                    ),
+                }
+            )
+
+        if not math.isclose(total_new_qty, original_qty, rel_tol=1e-6, abs_tol=1e-6):
+            raise ValueError(
+                f"La suma de cantidades ({total_new_qty}) no coincide con la linea original ({original_qty})."
+            )
+
+        new_lines: List[InvoiceLine] = []
+        new_explicit: List[Optional[dict]] = []
+        for resolved in resolved_items:
+            new_line = original_line.model_copy(
+                update={
+                    "detalle": resolved["name"],
+                    "cantidad": resolved["qty"],
+                    "precio_unitario": float(original_line.precio_unitario or 0.0),
+                    "subtotal": float(original_line.precio_unitario or 0.0) * resolved["qty"],
+                    "default_code": resolved["default_code"],
+                }
+            )
+            new_lines.append(new_line)
+            new_explicit.append(
+                {
+                    "product_id": resolved.get("product_id"),
+                    "default_code": resolved.get("default_code"),
+                }
+            )
+
+        lines = lines[:target_idx] + new_lines + lines[target_idx + 1 :]
+        explicit_map = explicit_map[:target_idx] + new_explicit + explicit_map[target_idx + 1 :]
+
+    return invoice.model_copy(update={"lines": lines}), explicit_map
+
+
 def extract_invoice_data(image_path: str) -> InvoiceData:
     """Ejecuta OCR sobre la imagen y valida que tenga los campos esperados."""
     logger.info(f"Extrayendo datos de la factura {image_path}")
@@ -66,14 +385,11 @@ def extract_invoice_data(image_path: str) -> InvoiceData:
     )
 
 
-def _load_purchase_order(invoice: InvoiceData) -> dict:
-    """Busca la orden/cotización más parecida usando proveedor y detalle de productos.
-    Si no existe, crea una nueva orden a partir de la factura."""
+def _find_purchase_order(invoice: InvoiceData) -> dict | None:
+    """Busca una orden/cotización similar en Odoo sin crear ni confirmar."""
     if not invoice.supplier_name:
         raise ValueError("La factura no indica el nombre del proveedor necesario para buscar en Odoo.")
     invoice_details = [line.detalle for line in invoice.lines]
-
-    created_from_invoice = False
     order = odoo_manager.find_purchase_order_by_similarity(
         invoice.supplier_name,
         invoice_details,
@@ -81,14 +397,22 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
         supplier_rut=getattr(invoice, "supplier_rut", None),
     )
     if order:
-        logger.info(f"Orden candidata en Odoo: {order.get('name')} (ID {order.get('id')})")
+        logger.info("Orden candidata en Odoo: %s (ID %s)", order.get("name"), order.get("id"))
+    return order
+
+
+def _load_purchase_order(invoice: InvoiceData) -> dict:
+    """Busca la orden/cotización más parecida usando proveedor y detalle de productos.
+    Si no existe, crea una nueva orden a partir de la factura."""
+    created_from_invoice = False
+    order = _find_purchase_order(invoice)
     if not order:
         logger.info("No se detectó una orden coincidente; creando una nueva en Odoo.")
         order = odoo_manager.create_purchase_order_from_invoice(invoice)
         created_from_invoice = True
 
     if not created_from_invoice and order.get("state") in {"draft", "sent"}:
-        logger.info(f"La orden {order['name']} está en estado {order['state']}. Confirmando…")
+        logger.info("La orden %s está en estado %s. Confirmando…", order.get("name"), order.get("state"))
         order = odoo_manager.confirm_purchase_order(order["id"])
 
     order["_created_from_invoice"] = created_from_invoice
@@ -96,7 +420,7 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
 
 
 def _finalize_order(order: dict, qty_by_product: Dict[int, float] | None = None) -> None:
-    """Confirma la recepción y genera la factura sólo si la orden lo requiere."""
+    """Confirma la recepción sin tocar facturas."""
     status = odoo_manager.get_order_status(order["id"])
     state = status.get("state")
     if state not in {"purchase", "done"}:
@@ -108,11 +432,7 @@ def _finalize_order(order: dict, qty_by_product: Dict[int, float] | None = None)
         odoo_manager.confirm_order_receipt({"picking_ids": picking_ids}, qty_by_product=qty_by_product or {})
     else:
         logger.info("La orden %s no tiene recepciones pendientes en Odoo.", order["name"])
-    invoice_ids = status.get("invoice_ids") or []
-    if invoice_ids:
-        logger.info("La orden %s ya tiene facturas (%s); se omite la creación automática.", order["name"], invoice_ids)
-        return
-    odoo_manager.create_invoice_for_order(order["id"])
+    return
 
 
 
@@ -256,10 +576,16 @@ def _verify_line(
     )
 
 
-def process_invoice_file(image_path: str) -> InvoiceResponseModel:
+def process_invoice_file(
+    image_path: str,
+    allow_odoo_write: bool = False,
+    split_plan: Optional[list[dict]] = None,
+) -> InvoiceResponseModel:
     """
     Orquesta todo el flujo: extrae la factura, localiza/convierte la orden en Odoo,
     compara cabecera y líneas, verifica recepción y construye el resumen final.
+    Si allow_odoo_write es False, funciona en modo lectura y solicita aprobacion.
+    split_plan permite desglosar lineas antes de crear la OC.
     """
     invoice = extract_invoice_data(image_path)
     ocr_dudoso = getattr(invoice, "ocr_dudoso", False)
@@ -406,15 +732,29 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         invoice.supplier_name,
         getattr(invoice, "supplier_rut", None),
     )
+    explicit_map: List[Optional[dict]] = []
+    if split_plan:
+        invoice, explicit_map = _apply_split_plan(invoice, split_plan, resolved_supplier_id)
     pending_products: List[ProcessedProduct] = []
     expected_product_ids: List[Optional[int]] = []
+    line_skus: List[Optional[str]] = []
+    sku_cache: Dict[int, Optional[str]] = {}
     require_confirmation = _truthy_env("REQUIRE_PRODUCT_CONFIRMATION", default=True)
-    for line in invoice.lines:
+    for idx, line in enumerate(invoice.lines):
+        explicit = explicit_map[idx] if explicit_map and idx < len(explicit_map) else None
+        explicit_product_id = (
+            odoo_manager._normalize_id(explicit.get("product_id")) if explicit else None
+        )
+        explicit_default_code = explicit.get("default_code") if explicit else None
         invoice_detail = line.detalle
         mapped_product_id = (
-            odoo_manager.get_mapped_product_id(invoice_detail, resolved_supplier_id)
-            if resolved_supplier_id is not None
-            else None
+            explicit_product_id
+            if explicit_product_id is not None
+            else (
+                odoo_manager.get_mapped_product_id(invoice_detail, resolved_supplier_id)
+                if resolved_supplier_id is not None
+                else None
+            )
         )
         candidates = odoo_manager.get_product_candidates(
             invoice_detail,
@@ -428,10 +768,33 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
         if best_default_code in (False, None, ""):
             best_default_code = None
         best_id = odoo_manager._normalize_id(best.get("id")) if isinstance(best, dict) else None
+        if explicit_default_code and not best_default_code:
+            best_default_code = explicit_default_code
+        if explicit_product_id is not None and best_id is None:
+            best_id = explicit_product_id
         expected_product_ids.append(mapped_product_id or best_id)
+        sku_value = explicit_default_code
+        mapped_norm = odoo_manager._normalize_id(mapped_product_id)
+        if mapped_norm is not None:
+            if mapped_norm in sku_cache:
+                sku_value = sku_cache[mapped_norm]
+            else:
+                sku_value = odoo_manager.get_sku_by_product_id(mapped_norm)
+                sku_cache[mapped_norm] = sku_value
+        if not sku_value and best_default_code:
+            sku_value = best_default_code
+        if not sku_value and best_id is not None:
+            if best_id in sku_cache:
+                sku_value = sku_cache[best_id]
+            else:
+                sku_value = odoo_manager.get_sku_by_product_id(best_id)
+                sku_cache[best_id] = sku_value
+        line_skus.append(sku_value)
 
         needs_review = False
-        if mapped_product_id is None:
+        if explicit_product_id is not None:
+            needs_review = False
+        elif mapped_product_id is None:
             if require_confirmation:
                 needs_review = True
             elif not candidates:
@@ -472,19 +835,56 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
             supplier_rut=getattr(invoice, "supplier_rut", None),
             status="WAITING_FOR_HUMAN",
         )
-
-    try:
-        order = _load_purchase_order(invoice)
-    except Exception as exc:
-        warning = f"{ocr_warning}. " if ocr_warning else ""
-        return InvoiceResponseModel(
-            summary=f"No se pudo crear/abrir la orden en Odoo: {warning}{exc}",
-            products=[],
-            needs_follow_up=True,
-            neto_match=False,
-            iva_match=False,
-            total_match=False,
-        )
+    order = None
+    if allow_odoo_write:
+        try:
+            order = _load_purchase_order(invoice)
+        except Exception as exc:
+            warning = f"{ocr_warning}. " if ocr_warning else ""
+            return InvoiceResponseModel(
+                summary=f"No se pudo crear/abrir la orden en Odoo: {warning}{exc}",
+                products=[],
+                needs_follow_up=True,
+                neto_match=False,
+                iva_match=False,
+                total_match=False,
+            )
+    else:
+        try:
+            order = _find_purchase_order(invoice)
+        except Exception as exc:
+            warning = f"{ocr_warning}. " if ocr_warning else ""
+            return InvoiceResponseModel(
+                summary=f"No se pudo buscar la orden en Odoo: {warning}{exc}",
+                products=[],
+                needs_follow_up=True,
+                neto_match=False,
+                iva_match=False,
+                total_match=False,
+            )
+        if not order:
+            summary_msg = _build_pre_approval_summary(
+                invoice,
+                image_path,
+                order=None,
+                supplier_id=resolved_supplier_id,
+                issue_count=0,
+                header_mismatch=False,
+                ocr_warning=ocr_warning,
+                line_skus=line_skus,
+            )
+            return InvoiceResponseModel(
+                summary=summary_msg,
+                products=[],
+                needs_follow_up=True,
+                neto_match=None,
+                iva_match=None,
+                total_match=None,
+                supplier_id=resolved_supplier_id,
+                supplier_name=invoice.supplier_name,
+                supplier_rut=getattr(invoice, "supplier_rut", None),
+                status="WAITING_FOR_APPROVAL",
+            )
 
     summary = _build_order_summary(order)
 
@@ -526,7 +926,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                 if line.cantidad != 0:
                     desired_values["price_unit"] = line.subtotal / line.cantidad
 
-            if desired_values:
+            if desired_values and allow_odoo_write:
                 odoo_manager.update_order_line(matched_line["id"], desired_values)
                 refreshed_line = odoo_manager.read_order_lines([matched_line["id"]])[0]
                 product_result.cantidad_match = (
@@ -543,7 +943,7 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                 else:
                     product_result.issues = (
                         product_result.issues
-                        or "No se pudieron ajustar los valores de la línea en Odoo."
+                        or "No se pudieron ajustar los valores de la linea en Odoo."
                     )
 
             receipt_info = receipt_by_product.get(matched_line.get("product_id"), {})
@@ -560,9 +960,10 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
             product_result = product_result.model_copy(update={"status": "MATCHED"})
         products.append(product_result)
 
-    odoo_manager.recompute_order_amounts(order["id"])
-    # Releer la orden tras las actualizaciones para usar totales y líneas frescos.
-    summary = _build_order_summary(order)
+    if allow_odoo_write:
+        odoo_manager.recompute_order_amounts(order["id"])
+        # Releer la orden tras las actualizaciones para usar totales y líneas frescos.
+        summary = _build_order_summary(order)
     neto_match = abs(summary["neto"] - invoice.neto) <= 1.0
     iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 1.0
     total_match = abs(summary["total"] - invoice.total) <= 1.0
@@ -582,20 +983,57 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
     if ocr_dudoso:
         needs_follow_up = True
 
+    if not allow_odoo_write:
+        issue_count = sum(1 for p in products if p.issues)
+        header_mismatch = not (neto_match and iva_match and total_match)
+        summary_msg = _build_pre_approval_summary(
+            invoice,
+            image_path,
+            order=order,
+            supplier_id=resolved_supplier_id,
+            issue_count=issue_count,
+            header_mismatch=header_mismatch,
+            ocr_warning=ocr_warning,
+            line_skus=line_skus,
+        )
+        return InvoiceResponseModel(
+            summary=summary_msg,
+            products=products,
+            needs_follow_up=True,
+            neto_match=neto_match,
+            iva_match=iva_match,
+            total_match=total_match,
+            supplier_id=resolved_supplier_id,
+            supplier_name=invoice.supplier_name,
+            supplier_rut=getattr(invoice, "supplier_rut", None),
+            status="WAITING_FOR_APPROVAL",
+        )
+
     # Construye resumen breve según caso.
     if not needs_follow_up:
-        try:
-            _finalize_order(order, qty_by_product=qty_by_product)
-            if order.get("_created_from_invoice"):
-                final_summary = (
-                    f"Se creó la orden de compra (ID {order['id']}). "
-                    f"Se recepcionó y facturó correctamente."
+        if allow_odoo_write:
+            action_summary = (
+                "OC creada en Odoo."
+                if order.get("_created_from_invoice")
+                else "OC actualizada en Odoo."
+            )
+            try:
+                finalize_summary = _finalize_and_post_order(order)
+            except Exception as exc:
+                error_summary = (
+                    f"{action_summary} No se pudo finalizar el flujo en Odoo: {exc}"
                 )
-            else:
-                final_summary = (
-                    f"Se editó la orden de compra (ID {order['id']}). "
-                    f"Se recepcionó y facturó correctamente."
+                return InvoiceResponseModel(
+                    summary=error_summary,
+                    products=products,
+                    needs_follow_up=True,
+                    neto_match=neto_match,
+                    iva_match=iva_match,
+                    total_match=total_match,
+                    po_name=order.get("name"),
+                    po_id=order.get("id"),
                 )
+            final_summary = f"{action_summary} {finalize_summary}"
             return InvoiceResponseModel(
                 summary=final_summary,
                 products=products,
@@ -603,28 +1041,28 @@ def process_invoice_file(image_path: str) -> InvoiceResponseModel:
                 neto_match=neto_match,
                 iva_match=iva_match,
                 total_match=total_match,
+                po_name=order.get("name"),
+                po_id=order.get("id"),
             )
-        except Exception as exc:
-            logger.error(f"No se pudo cerrar automáticamente la orden {order['name']}: {exc}")
-            error_summary = "No se pudo crear/editar OC, revisar Odoo manualmente."
-            product_issues = [
-                ProcessedProduct(
-                    detalle=p.detalle if hasattr(p, "detalle") else "desconocido",
-                    cantidad_match=getattr(p, "cantidad_match", False),
-                    precio_match=getattr(p, "precio_match", False),
-                    subtotal_match=getattr(p, "subtotal_match", False),
-                    issues=getattr(p, "issues", None),
-                )
-                for p in products
-            ] or []
-            return InvoiceResponseModel(
-                summary=error_summary,
-                products=product_issues,
-                needs_follow_up=True,
-                neto_match=neto_match,
-                iva_match=iva_match,
-                total_match=total_match,
+        error_summary = "No se pudo crear/editar OC, revisar Odoo manualmente."
+        product_issues = [
+            ProcessedProduct(
+                detalle=p.detalle if hasattr(p, "detalle") else "desconocido",
+                cantidad_match=getattr(p, "cantidad_match", False),
+                precio_match=getattr(p, "precio_match", False),
+                subtotal_match=getattr(p, "subtotal_match", False),
+                issues=getattr(p, "issues", None),
             )
+            for p in products
+        ] or []
+        return InvoiceResponseModel(
+            summary=error_summary,
+            products=product_issues,
+            needs_follow_up=True,
+            neto_match=neto_match,
+            iva_match=iva_match,
+            total_match=total_match,
+        )
 
     # Construye resumen detallado de discrepancias.
     discrepancy_parts: List[str] = []
