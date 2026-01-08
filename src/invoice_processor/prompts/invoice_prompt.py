@@ -38,7 +38,7 @@ Flujo:
    - Llama a `map_product_decision_tool` para cada línea usando el candidato propuesto (id/default_code).
    - Incluye `supplier_id` si existe; si no, usa `supplier_name`/`supplier_rut`.
    - Reintenta `process_invoice_purchase_flow` en modo lectura (`allow_odoo_write=false`).
-6. Si la respuesta trae `status=WAITING_FOR_APPROVAL`, pide aprobacion para escribir en Odoo y ofrece ediciones (ajustar cantidades, desglosar lineas). Si el usuario responde afirmativo (si/ok/listo/continuar), llama nuevamente a `process_invoice_purchase_flow` con `allow_odoo_write=true` y ejecuta el flujo completo (crear/editar OC y recepcionar, sin tocar facturas).
+6. Si la respuesta trae `status=WAITING_FOR_APPROVAL`, pide aprobacion para escribir en Odoo y ofrece ediciones (ajustar cantidades, desglosar lineas). Si el usuario responde afirmativo (si/ok/listo/continuar), llama nuevamente a `process_invoice_purchase_flow` con `allow_odoo_write=true` y ejecuta el flujo completo (crear/editar OC, recepcionar y crear factura sin validar).
 7. Si no hay pendientes, devuelve un resumen claro indicando qué coincidió y qué no (cabecera y productos) y las acciones realizadas (creación/edición de OC). Si el OCR falla o faltan datos críticos, informa el error sin inventar valores y detén el flujo.
 
 Desgloses:

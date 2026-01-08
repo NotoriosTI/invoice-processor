@@ -134,7 +134,7 @@ def _build_pre_approval_summary(
     else:
         parts.append(
             "- **No se encontró una OC coincidente**; si continuamos, el flujo "
-            "**creará una nueva OC** y luego **recepcionará** (sin tocar facturas)."
+            "**creará una nueva OC**, luego **recepcionará** y **creará la factura**."
         )
     if issue_count:
         parts.append(f"- Hay **{issue_count}** línea(s) con diferencias vs Odoo.")
@@ -160,9 +160,13 @@ def _build_pre_approval_summary(
             f"1) Para {missing_label}, dime el **SKU** o el producto correcto en Odoo "
             f"(ej: \"Cambiar {example_detail} por MP0XX\")."
         )
-        parts.append("2) Con eso listo, **confirmo y continúo** (crear OC + recepcionar)?")
+        parts.append(
+            "2) Con eso listo, **confirmo y continúo** (crear OC + recepcionar + crear factura)?"
+        )
     else:
-        parts.append("1) Si todo está correcto, **confirmo y continúo** (crear OC + recepcionar)?")
+        parts.append(
+            "1) Si todo está correcto, **confirmo y continúo** (crear OC + recepcionar + crear factura)?"
+        )
     return "\n".join(parts)
 
 
@@ -248,7 +252,8 @@ def _finalize_and_post_order(order: dict) -> str:
     else:
         pickings_info = " Sin pickings."
 
-    return f"OC {order.get('name')}: recepcionada.{pickings_info}"
+    odoo_manager.create_invoice_for_order(order_id)
+    return f"OC {order.get('name')}: recepcionada y factura creada.{pickings_info}"
 
 
 def _looks_like_sku(value: str) -> bool:
@@ -453,7 +458,7 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
 
 
 def _finalize_order(order: dict, qty_by_product: Dict[int, float] | None = None) -> None:
-    """Confirma la recepción sin tocar facturas."""
+    """Confirma la recepción y crea la factura (sin validar)."""
     status = odoo_manager.get_order_status(order["id"])
     state = status.get("state")
     if state not in {"purchase", "done"}:
@@ -465,6 +470,7 @@ def _finalize_order(order: dict, qty_by_product: Dict[int, float] | None = None)
         odoo_manager.confirm_order_receipt({"picking_ids": picking_ids}, qty_by_product=qty_by_product or {})
     else:
         logger.info("La orden %s no tiene recepciones pendientes en Odoo.", order["name"])
+    odoo_manager.create_invoice_for_order(order["id"])
     return
 
 

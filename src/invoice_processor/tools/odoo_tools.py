@@ -406,7 +406,7 @@ def update_line_quantity(po_name: str, product_keyword: str, new_qty: float) -> 
 
 @tool("finalize_invoice_workflow", args_schema=FinalizeInvoiceWorkflowArgs)
 def finalize_invoice_workflow(po_name: str, block_if_line_keyword_present: str | None = None) -> str:
-    """Confirma OC y recepciona (sin tocar facturas)."""
+    """Confirma OC, recepciona y crea la factura (sin validar)."""
     try:
         order = _get_unique_order_by_name(po_name)
         order_id = odoo_manager._normalize_id(order.get("id"))
@@ -457,9 +457,10 @@ def finalize_invoice_workflow(po_name: str, block_if_line_keyword_present: str |
             else " Sin pickings."
         )
         action_summary = ", ".join(actions) if actions else "ejecutado"
+        odoo_manager.create_invoice_for_order(order_id)
         return (
             f"OC {order.get('name') or po_name}: flujo {action_summary}. "
-            f"Recepcion confirmada.{pickings_info}"
+            f"Recepcion confirmada y factura creada.{pickings_info}"
         )
     except xmlrpc.client.Fault as exc:
         logger.exception("Odoo Fault en finalize_invoice_workflow: %s", exc)
