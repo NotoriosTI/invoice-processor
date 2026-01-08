@@ -1,15 +1,17 @@
 from pathlib import Path
 from queue import Queue
 import logging
+import re
 import requests
 from langchain_core.messages import SystemMessage, HumanMessage
 from rich.logging import RichHandler
 from rich.traceback import install
 
 from .slack_bot import SlackBot
-from ..config import get_settings
-from ..prompts.prompts import INVOICE_PROMPT
+from ..config import get_settings, load_allowed_users
+from ..prompts import INVOICE_PROMPT
 from ..agents.agent import invoice_agent
+from ..core.models import InvoiceResponseModel
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -59,7 +61,10 @@ def format_messages(text: str, file_path: str, is_new: bool):
 
 def run_slack_bot():
     configure_logging()
+    allowed = load_allowed_users()
     message_queue = Queue()
+    last_file_by_thread: dict[str, Path] = {}
+    last_status_by_thread: dict[str, str] = {}
     slack_bot = SlackBot(
         app_token=settings.slack_app_token,
         bot_token=settings.slack_bot_token,
@@ -71,9 +76,17 @@ def run_slack_bot():
 
     while True:
         payload = message_queue.get()
+        user_id = payload.get("user") or payload.get("user_id")
         event = payload.get("event") or payload  # algunos adaptadores entregan el evento anidado
         inner_message = event.get("message") or {}
         previous_message = inner_message.get("previous_message", {}) or event.get("previous_message", {}) or {}
+
+        # Filtro de usuarios autorizados
+        if allowed.get("enabled"):
+            allowed_ids = {u["id"] if isinstance(u, dict) else u for u in allowed.get("users", [])}
+            if user_id not in allowed_ids:
+                logger.info("Usuario no autorizado: %s; se ignora el evento", user_id)
+                continue
 
         # Datos base del evento
         user_id = event.get("user") or event.get("user_id") or inner_message.get("user") or previous_message.get("user")
@@ -136,27 +149,36 @@ def run_slack_bot():
             if fetched_files:
                 files = fetched_files
 
+        file_path: Path | None = None
         if not files:
-            if not incoming_text:
-                logger.debug("Evento sin adjuntos ni texto; se ignora.")
+            # Reusar la última factura del thread si existe
+            file_path = last_file_by_thread.get(user_id) if user_id else None
+            if not file_path or not file_path.exists():
+                if not incoming_text:
+                    logger.debug("Evento sin adjuntos ni texto; se ignora.")
+                    continue
+                logger.info("Evento sin adjuntos y sin factura previa; solicitando nueva factura al usuario %s", user_id)
+                post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
                 continue
-            logger.info("Evento sin adjuntos; solicitando nueva factura al usuario %s", user_id)
-            post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
-            continue
+        else:
+            file_info = files[0]
+            mimetype = (file_info.get("mimetype") or file_info.get("filetype") or "").lower()
+            if "image" not in mimetype:
+                logger.info("Adjunto ignorado por no ser imagen (mimetype=%s).", mimetype)
+                post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
+                continue
+            try:
+                file_path = download_file(file_info, Path("/tmp/invoices") / (user_id or "unknown"))
+                if user_id:
+                    last_file_by_thread[user_id] = file_path
+            except Exception as exc:
+                logger.exception("No se pudo descargar el archivo de Slack")
+                post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
+                continue
 
-        # Valida que el archivo principal sea imagen; si no, solicita PNG/JPG.
-        file_info = files[0]
-        mimetype = (file_info.get("mimetype") or file_info.get("filetype") or "").lower()
-        if "image" not in mimetype:
-            logger.info("Adjunto ignorado por no ser imagen (mimetype=%s).", mimetype)
+        if not file_path:
+            logger.warning("No se pudo determinar la ruta del archivo para el evento; se solicita nueva factura.")
             post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
-            continue
-
-        try:
-            file_path = download_file(file_info, Path("/tmp/invoices") / user_id)
-        except Exception as exc:
-            logger.exception("No se pudo descargar el archivo de Slack")
-            post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
             continue
         config = {"configurable": {"thread_id": user_id}}
 
@@ -165,6 +187,14 @@ def run_slack_bot():
         # Si no hay texto, usar un mensaje por defecto
         if not incoming_text:
             incoming_text = "Procesa esta factura."
+        last_status = last_status_by_thread.get(user_id)
+        if last_status in {"WAITING_FOR_HUMAN", "WAITING_FOR_APPROVAL"} and _is_affirmative(incoming_text):
+            if last_status == "WAITING_FOR_HUMAN":
+                incoming_text = "Afirmativo"
+            elif last_status == "WAITING_FOR_APPROVAL":
+                incoming_text = "Continuar"
+            logger.info("Respuesta afirmativa normalizada para estado=%s.", last_status)
+
         messages = format_messages(incoming_text, str(file_path), is_new_thread)
 
         try:
@@ -177,36 +207,69 @@ def run_slack_bot():
                 "Ocurrió un error al procesar la factura. Intenta nuevamente más tarde.",
                 timestamp,
             )
-            try:
-                add_reaction(channel, timestamp, "x")
-            except Exception:
-                logger.debug("No se pudo agregar reacción de error al mensaje original.")
             continue
         # Prefiere la respuesta estructurada del modelo si existe; evita la conversación interna.
-        structured = getattr(result, "structured_response", None)
-        if structured and hasattr(structured, "summary"):
-            response = structured.summary
-            needs_follow_up = getattr(structured, "needs_follow_up", False)
-        elif hasattr(result, "summary"):
-            response = result.summary
-            needs_follow_up = getattr(result, "needs_follow_up", False)
-        else:
-            response = str(result)
-            needs_follow_up = False
+        response_model: InvoiceResponseModel | None = _coerce_response_model(result)
+        if response_model:
+            needs_follow_up = bool(response_model.needs_follow_up)
+            if response_model.status:
+                last_status_by_thread[user_id] = response_model.status
+            else:
+                last_status_by_thread.pop(user_id, None)
+            if needs_follow_up and response_model.status == "WAITING_FOR_HUMAN" and response_model.products:
+                first = response_model.products[0]
+                supplier_name = getattr(first, "supplier_name", None) or "Desconocido"
+                lines: list[str] = []
+                for idx, prod in enumerate(response_model.products, start=1):
+                    invoice_detail = getattr(prod, "invoice_detail", None) or getattr(prod, "detalle", None) or ""
+                    candidate_name = getattr(prod, "candidate_name", None)
+                    candidate_default_code = getattr(prod, "candidate_default_code", None)
+                    if not candidate_name and getattr(prod, "candidates", None):
+                        best = (prod.candidates or [None])[0]
+                        candidate_name = getattr(best, "name", None) if best is not None else None
+                        candidate_default_code = getattr(best, "default_code", None) if best is not None else None
+                    candidate_name = candidate_name or "(sin candidato)"
+                    sku_label = candidate_default_code or "N/A"
+                    lines.append(
+                        f"{idx}. *{invoice_detail}* ➔  _{candidate_name}_  (SKU: `{sku_label}`)"
+                    )
 
-        # Reacciona en el mensaje original: verde si todo OK y se cerró flujo; rojo + mensaje si hay follow-up.
+                response = "\n".join(
+                    [
+                        "🛑 *Confirmación Requerida*",
+                        f"Proveedor Detectado: {supplier_name}",
+                        "",
+                        "*Productos por Ingresar a Odoo:*",
+                        *lines,
+                        "",
+                        "*Instrucciones:*",
+                        '- Si la lista es correcta, responde: *"Afirmativo"*. ',
+                        '- Para corregir, indica: *"Cambiar {Producto Factura} por {Nombre Correcto o SKU}"*.',
+                    ]
+                )
+            elif needs_follow_up and response_model.status == "WAITING_FOR_APPROVAL":
+                response = response_model.summary
+            else:
+                response = response_model.summary
+        else:
+            # Evita enviar conversación interna u objetos desconocidos.
+            response = "No se pudo procesar la factura; revisa Odoo manualmente."
+            needs_follow_up = True
+
+        # Reacciona en el mensaje original: verde si todo OK y se cerró flujo; si hay follow-up solo responde.
         if not needs_follow_up:
             try:
                 add_reaction(channel, timestamp, "white_check_mark")
             except Exception:
                 logger.debug("No se pudo agregar reacción de éxito al mensaje original.")
-            # No enviamos texto adicional cuando todo está OK.
+            # Enviar también el resumen de lo que se hizo.
+            try:
+                post_message(channel, response, timestamp)
+            except Exception as exc:
+                logger.error("No se pudo enviar mensaje a Slack: %s", exc)
+                logger.debug("Respuesta que falló: %s", response)
             continue
         else:
-            try:
-                add_reaction(channel, timestamp, "x")
-            except Exception:
-                logger.debug("No se pudo agregar reacción de error al mensaje original.")
             try:
                 post_message(channel, response, timestamp)
             except Exception as exc:
@@ -271,3 +334,85 @@ def _fetch_files_from_slack(channel: str | None, ts: str | None):
     except Exception as exc:
         logger.warning("No se pudieron recuperar archivos desde Slack: %s", exc)
         return []
+def _coerce_response_model(result) -> InvoiceResponseModel | None:
+    """Intenta extraer InvoiceResponseModel desde distintos formatos de resultado."""
+    try:
+        if isinstance(result, InvoiceResponseModel):
+            return result
+
+        # Caso atributo structured_response
+        structured = getattr(result, "structured_response", None)
+        if structured:
+            if isinstance(structured, InvoiceResponseModel):
+                return structured
+            try:
+                return InvoiceResponseModel.model_validate(structured)
+            except Exception:
+                pass
+
+        # Caso dict con structured_response o campos del modelo
+        if isinstance(result, dict):
+            if "structured_response" in result:
+                try:
+                    return InvoiceResponseModel.model_validate(result["structured_response"])
+                except Exception:
+                    pass
+            try:
+                return InvoiceResponseModel.model_validate(result)
+            except Exception:
+                pass
+
+        # Caso atributo dict interno
+        if hasattr(result, "__dict__"):
+            data = result.__dict__
+            if "structured_response" in data:
+                try:
+                    return InvoiceResponseModel.model_validate(data["structured_response"])
+                except Exception:
+                    pass
+            try:
+                return InvoiceResponseModel.model_validate(data)
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _normalize_text(text: str) -> str:
+    cleaned = re.sub(r"[^\wáéíóúüñ ]", " ", (text or "").lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_affirmative(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    if normalized in {
+        "si",
+        "sí",
+        "ok",
+        "okay",
+        "okey",
+        "dale",
+        "listo",
+        "afirmativo",
+        "confirmo",
+        "continuar",
+        "continua",
+        "continuo",
+        "vamos",
+        "adelante",
+    }:
+        return True
+    if normalized in {
+        "de acuerdo",
+        "tienes permiso",
+        "tiene permiso",
+        "autorizo",
+        "autorizado",
+        "autorizada",
+    }:
+        return True
+    return False
+    return None

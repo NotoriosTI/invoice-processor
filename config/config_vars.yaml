@@ -1,15 +1,15 @@
 variables:
-  ODOO_TEST_URL:
-    source: ODOO_TEST_URL
+  ODOO_PROD_URL:
+    source: ODOO_PROD_URL
     type: str
-  ODOO_TEST_DB:
-    source: ODOO_TEST_DB
+  ODOO_PROD_DB:
+    source: ODOO_PROD_DB
     type: str
-  ODOO_TEST_USERNAME:
-    source: ODOO_TEST_USERNAME
+  ODOO_PROD_USERNAME:
+    source: ODOO_PROD_USERNAME
     type: str
-  ODOO_TEST_PASSWORD:
-    source: ODOO_TEST_PASSWORD
+  ODOO_PROD_PASSWORD:
+    source: ODOO_PROD_PASSWORD
     type: str
 
   OPENAI_API_KEY:
@@ -18,7 +18,17 @@ variables:
   LLM_MODEL:
     source: LLM_MODEL
     type: str
-    default: "gpt-4o-mini"
+    default: "gpt-5.2"
+
+  EMBEDDING_MODEL:
+    source: EMBEDDING_MODEL
+    type: str
+    default: "text-embedding-3-small"
+
+  DEFAULT_PURCHASE_TAX_IDS:
+    source: DEFAULT_PURCHASE_TAX_IDS
+    type: str
+    default: ""
 
   SLACK_APP_TOKEN:
     source: INVOICE_SLACK_APP_TOKEN
@@ -32,22 +42,49 @@ variables:
     type: bool
     default: false
 
+  LANGSMITH_TRACING:
+    source: LANGSMITH_TRACING
+    type: bool
+    default: false
+  LANGSMITH_ENDPOINT:
+    source: LANGSMITH_ENDPOINT
+    type: str
+    default: ""
+  LANGSMITH_API_KEY:
+    source: LANGSMITH_API_KEY
+    type: str
+    default: ""
+  LANGSMITH_PROJECT:
+    source: LANGSMITH_PROJECT
+    type: str
+    default: ""
+  LANGSMITH_PROJECT_ID:
+    source: LANGSMITH_PROJECT_ID
+    type: str
+    default: ""
+
   DATA_PATH:
     source: DATA_PATH
     type: str
-    default: /Users/bastianibanez/work/invoice-processor/data
+    default: ./data
 
 validation:
   required:
-    - ODOO_TEST_URL
-    - ODOO_TEST_DB
-    - ODOO_TEST_USERNAME
-    - ODOO_TEST_PASSWORD
+    - ODOO_PROD_URL
+    - ODOO_PROD_DB
+    - ODOO_PROD_USERNAME
+    - ODOO_PROD_PASSWORD
     - OPENAI_API_KEY
     - SLACK_APP_TOKEN
     - SLACK_BOT_TOKEN
     - DATA_PATH
   optional:
+    - DEFAULT_PURCHASE_TAX_IDS
     - LLM_MODEL
     - SLACK_DEBUG_LOGS
+    - LANGSMITH_TRACING
+    - LANGSMITH_ENDPOINT
+    - LANGSMITH_API_KEY
+    - LANGSMITH_PROJECT
+    - LANGSMITH_PROJECT_ID
   strict: false

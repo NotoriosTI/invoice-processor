@@ -3,7 +3,7 @@ from uuid import uuid4
 from env_manager import get_config
 from langchain_core.messages import SystemMessage, HumanMessage
 from ..agents.agent import invoice_agent, invoice_reader_agent
-from ..prompts.prompts import INVOICE_PROMPT, INVOICE_READER_PROMPT
+from ..prompts import INVOICE_PROMPT, INVOICE_READER_PROMPT
 from .slack_handler import run_slack_bot
 import logging
 from rich.logging import RichHandler

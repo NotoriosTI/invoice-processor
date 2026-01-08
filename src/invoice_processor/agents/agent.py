@@ -3,9 +3,23 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from ..config import get_settings
 from ..core.models import InvoiceData, InvoiceResponseModel
-from ..tools.tools import parse_invoice_image, process_invoice_purchase_flow
+from ..tools.tools import parse_invoice_image, process_invoice_purchase_flow, map_product_decision_tool
+from ..tools.odoo_tools import (
+    split_purchase_line,
+    update_line_quantity,
+    finalize_invoice_workflow,
+    receive_order_by_sku_prefix,
+)
 
-tools = [parse_invoice_image, process_invoice_purchase_flow]
+tools = [
+    parse_invoice_image,
+    process_invoice_purchase_flow,
+    map_product_decision_tool,
+    split_purchase_line,
+    update_line_quantity,
+    finalize_invoice_workflow,
+    receive_order_by_sku_prefix,
+]
 checkpointer = MemorySaver()
 reader_tools = [parse_invoice_image]
 reader_checkpointer = MemorySaver()
