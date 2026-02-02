@@ -74,6 +74,39 @@ def run_slack_bot():
         message_queue=message_queue,
         debug=bool(settings.slack_debug_logs),
     )
+
+    # Middleware: el handler base de SlackBot descarta mensajes sin texto
+    # (`if user_id and text`). Este middleware intercepta eventos de tipo
+    # "message" con archivos de imagen pero sin texto, y los encola antes
+    # de que el handler base los descarte.
+    _audio_filetypes = {"m4a", "mp3", "mp4", "ogg", "wav"}
+
+    def _enqueue_image_only(body, next):
+        event = body.get("event") or {}
+        if (
+            event.get("type") == "message"
+            and "files" in event
+            and not event.get("text")
+            and event.get("user")
+            and not event.get("bot_id")
+        ):
+            has_image = any(
+                f.get("filetype") not in _audio_filetypes
+                for f in event["files"]
+            )
+            if has_image:
+                message_queue.put({
+                    "user_id": event["user"],
+                    "text": "",
+                    "audio_file": False,
+                    "channel": event.get("channel"),
+                    "timestamp": event.get("ts"),
+                    "files": event["files"],
+                })
+        next()
+
+    slack_bot.app.use(_enqueue_image_only)
+
     logger.info("Iniciando Slack bot (debug=%s)", settings.slack_debug_logs)
     slack_bot.start()
 
