@@ -12,6 +12,7 @@ from difflib import SequenceMatcher
 from ..infrastructure.services.odoo_connection_manager import MIN_PRODUCT_CONFIDENCE, odoo_manager
 from .models import InvoiceData, InvoiceLine, ProcessedProduct, InvoiceResponseModel
 from ..infrastructure.services.ocr import InvoiceOcrClient
+from ..tools.odoo_tools import _resolve_product_by_term
 
 install()
 if not logging.getLogger().handlers:
@@ -184,7 +185,11 @@ def _resolve_invoice_type_field() -> str:
     return "move_type"
 
 
-def _finalize_and_post_order(order: dict) -> str:
+def _finalize_and_post_order(
+    order: dict,
+    folio: str | None = None,
+    fecha_emision: str | None = None,
+) -> str:
     order_id = odoo_manager._normalize_id(order.get("id"))
     if order_id is None:
         raise RuntimeError("No se pudo resolver el id de la OC.")
@@ -252,64 +257,17 @@ def _finalize_and_post_order(order: dict) -> str:
     else:
         pickings_info = " Sin pickings."
 
-    odoo_manager.create_invoice_for_order(order_id)
-    return f"OC {order.get('name')}: recepcionada y factura creada.{pickings_info}"
-
-
-def _looks_like_sku(value: str) -> bool:
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", value or "")
-    return bool(cleaned) and (" " not in (value or ""))
-
-
-def _resolve_product_for_split(term: str, supplier_id: Optional[int]) -> dict:
-    term_norm = (term or "").strip()
-    if not term_norm:
-        raise ValueError("product_search_term no puede estar vacio.")
-    raw = term_norm.strip("`'\"").strip()
-    sku_hint = raw
-    if raw.lower().startswith("sku:"):
-        sku_hint = raw.split(":", 1)[1].strip()
-    product_id = None
-    if sku_hint and _looks_like_sku(sku_hint):
-        product_id = odoo_manager._resolve_product_by_default_code(sku_hint, supplier_id)
-    if product_id:
-        recs = odoo_manager._execute_kw(
-            "product.product",
-            "read",
-            [[int(product_id)]],
-            {"fields": ["id", "name", "default_code"]},
-        )
-        if recs:
-            return recs[0]
-
-    def _search_by_name(with_supplier: bool) -> List[dict]:
-        domain = [["name", "ilike", raw], ["purchase_ok", "=", True]]
-        if with_supplier and supplier_id is not None:
-            domain.append(["seller_ids.partner_id", "=", int(supplier_id)])
-        return odoo_manager._execute_kw(
-            "product.product",
-            "search_read",
-            [domain],
-            {"fields": ["id", "name", "default_code"], "limit": 5},
-        ) or []
-
-    products = _search_by_name(with_supplier=True)
-    if not products:
-        products = _search_by_name(with_supplier=False)
-    if not products:
-        raise ValueError(f"No se encontro producto para '{term_norm}'.")
-    if len(products) > 1:
-        candidates = []
-        for prod in products:
-            prod_id = odoo_manager._normalize_id(prod.get("id"))
-            name = prod.get("name") or "sin_nombre"
-            sku = prod.get("default_code")
-            sku_label = f" SKU {sku}" if sku else ""
-            candidates.append(f"[{prod_id}] {name}{sku_label}")
-        raise ValueError(
-            f"Busqueda ambigua para '{term_norm}'. Candidatos: {', '.join(candidates)}."
-        )
-    return products[0]
+    inv_result = odoo_manager.create_invoice_for_order(
+        order_id, ref=folio, invoice_date=fecha_emision
+    )
+    inv_ids = inv_result.get("invoice_ids", []) if isinstance(inv_result, dict) else []
+    posted = inv_result.get("posted", False) if isinstance(inv_result, dict) else False
+    inv_info = ""
+    if inv_ids:
+        inv_info = f" Factura(s): {inv_ids}."
+        if posted:
+            inv_info += " Publicada."
+    return f"OC {order.get('name')}: recepcionada y factura creada.{pickings_info}{inv_info}"
 
 
 def _apply_split_plan(
@@ -365,7 +323,7 @@ def _apply_split_plan(
             if qty_value <= 0:
                 raise ValueError("Cada qty en el desglose debe ser > 0.")
             total_new_qty += qty_value
-            product = _resolve_product_for_split(term, supplier_id)
+            product = _resolve_product_by_term(term, supplier_id=supplier_id)
             resolved_items.append(
                 {
                     "qty": qty_value,
@@ -457,8 +415,13 @@ def _load_purchase_order(invoice: InvoiceData) -> dict:
     return order
 
 
-def _finalize_order(order: dict, qty_by_product: Dict[int, float] | None = None) -> None:
-    """Confirma la recepción y crea la factura (sin validar)."""
+def _finalize_order(
+    order: dict,
+    qty_by_product: Dict[int, float] | None = None,
+    folio: str | None = None,
+    fecha_emision: str | None = None,
+) -> None:
+    """Confirma la recepción y crea la factura."""
     status = odoo_manager.get_order_status(order["id"])
     state = status.get("state")
     if state not in {"purchase", "done"}:
@@ -470,7 +433,7 @@ def _finalize_order(order: dict, qty_by_product: Dict[int, float] | None = None)
         odoo_manager.confirm_order_receipt({"picking_ids": picking_ids}, qty_by_product=qty_by_product or {})
     else:
         logger.info("La orden %s no tiene recepciones pendientes en Odoo.", order["name"])
-    odoo_manager.create_invoice_for_order(order["id"])
+    odoo_manager.create_invoice_for_order(order["id"], ref=folio, invoice_date=fecha_emision)
     return
 
 
@@ -714,14 +677,11 @@ def process_invoice_file(
     for line in invoice.lines:
         expected_subtotal = line.precio_unitario * line.cantidad
         if abs(expected_subtotal - line.subtotal) > 1.0 and line.cantidad != 0:
-            # Prefiere ajustar subtotal a cantidad x precio; recalcula precio unitario coherente.
-            corrected_subtotal = expected_subtotal
-            corrected_price = corrected_subtotal / line.cantidad
+            # Prefiere ajustar subtotal a cantidad x precio; precio_unitario ya es coherente.
             normalized_lines.append(
                 line.model_copy(
                     update={
-                        "subtotal": corrected_subtotal,
-                        "precio_unitario": corrected_price,
+                        "subtotal": expected_subtotal,
                     }
                 )
             )
@@ -1057,7 +1017,11 @@ def process_invoice_file(
                 else "OC actualizada en Odoo."
             )
             try:
-                finalize_summary = _finalize_and_post_order(order)
+                finalize_summary = _finalize_and_post_order(
+                    order,
+                    folio=invoice.folio,
+                    fecha_emision=invoice.fecha_emision,
+                )
             except Exception as exc:
                 error_summary = (
                     f"{action_summary} No se pudo finalizar el flujo en Odoo: {exc}"

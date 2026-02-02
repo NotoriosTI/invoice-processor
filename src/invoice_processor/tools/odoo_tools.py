@@ -42,6 +42,14 @@ class FinalizeInvoiceWorkflowArgs(BaseModel):
         default=None,
         description="Si se indica, bloquea el cierre si existe una linea que contenga este texto.",
     )
+    folio: str | None = Field(
+        default=None,
+        description="Numero de folio de la factura del proveedor.",
+    )
+    fecha_emision: str | None = Field(
+        default=None,
+        description="Fecha de emision de la factura (YYYY-MM-DD).",
+    )
 
 
 class ReceiveOrderBySkuPrefixArgs(BaseModel):
@@ -177,11 +185,22 @@ def _find_matching_lines(lines: List[dict], keyword: str) -> List[dict]:
 
 
 def _looks_like_sku(value: str) -> bool:
+    """Determina si un valor parece un SKU (sin espacios, alfanumérico)."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", value or "")
     return bool(cleaned) and (" " not in (value or ""))
 
 
-def _resolve_product_by_term(term: str, supplier_id: int | None = None) -> dict:
+def _resolve_product_by_term(
+    term: str,
+    supplier_id: int | None = None,
+    extra_fields: list[str] | None = None,
+) -> dict:
+    """Resuelve un producto en Odoo por SKU o nombre.
+
+    Si supplier_id está presente, primero busca filtrando por proveedor;
+    si no encuentra resultados, busca sin filtro.
+    extra_fields permite solicitar campos adicionales de product.product.
+    """
     term_norm = (term or "").strip()
     if not term_norm:
         raise ValueError("product_search_term no puede estar vacio.")
@@ -189,6 +208,11 @@ def _resolve_product_by_term(term: str, supplier_id: int | None = None) -> dict:
     sku_hint = raw
     if raw.lower().startswith("sku:"):
         sku_hint = raw.split(":", 1)[1].strip()
+
+    base_fields = ["id", "name", "default_code", "uom_po_id", "uom_id"]
+    if extra_fields:
+        base_fields = list(dict.fromkeys(base_fields + extra_fields))
+
     product_id = None
     if sku_hint and _looks_like_sku(sku_hint):
         try:
@@ -200,19 +224,25 @@ def _resolve_product_by_term(term: str, supplier_id: int | None = None) -> dict:
             "product.product",
             "read",
             [[int(product_id)]],
-            {"fields": ["id", "name", "default_code", "uom_po_id", "uom_id"]},
+            {"fields": base_fields},
         )
         if recs:
             return recs[0]
 
-    domain = [["name", "ilike", raw], ["purchase_ok", "=", True]]
-    products = odoo_manager._execute_kw(
-        "product.product",
-        "search_read",
-        [domain],
-        {"fields": ["id", "name", "default_code", "uom_po_id", "uom_id"], "limit": 5},
-    )
-    products = products or []
+    def _search_by_name(with_supplier: bool) -> list[dict]:
+        domain = [["name", "ilike", raw], ["purchase_ok", "=", True]]
+        if with_supplier and supplier_id is not None:
+            domain.append(["seller_ids.partner_id", "=", int(supplier_id)])
+        return odoo_manager._execute_kw(
+            "product.product",
+            "search_read",
+            [domain],
+            {"fields": base_fields, "limit": 5},
+        ) or []
+
+    products = _search_by_name(with_supplier=True) if supplier_id is not None else []
+    if not products:
+        products = _search_by_name(with_supplier=False)
     if not products:
         raise ValueError(f"No se encontro producto para '{term_norm}'.")
     if len(products) > 1:
@@ -405,8 +435,13 @@ def update_line_quantity(po_name: str, product_keyword: str, new_qty: float) -> 
 
 
 @tool("finalize_invoice_workflow", args_schema=FinalizeInvoiceWorkflowArgs)
-def finalize_invoice_workflow(po_name: str, block_if_line_keyword_present: str | None = None) -> str:
-    """Confirma OC, recepciona y crea la factura (sin validar)."""
+def finalize_invoice_workflow(
+    po_name: str,
+    block_if_line_keyword_present: str | None = None,
+    folio: str | None = None,
+    fecha_emision: str | None = None,
+) -> str:
+    """Confirma OC, recepciona y crea la factura con folio y fecha."""
     try:
         order = _get_unique_order_by_name(po_name)
         order_id = odoo_manager._normalize_id(order.get("id"))
@@ -457,10 +492,19 @@ def finalize_invoice_workflow(po_name: str, block_if_line_keyword_present: str |
             else " Sin pickings."
         )
         action_summary = ", ".join(actions) if actions else "ejecutado"
-        odoo_manager.create_invoice_for_order(order_id)
+        inv_result = odoo_manager.create_invoice_for_order(
+            order_id, ref=folio, invoice_date=fecha_emision
+        )
+        inv_ids = inv_result.get("invoice_ids", []) if isinstance(inv_result, dict) else []
+        posted = inv_result.get("posted", False) if isinstance(inv_result, dict) else False
+        inv_info = ""
+        if inv_ids:
+            inv_info = f" Factura(s): {inv_ids}."
+            if posted:
+                inv_info += " Publicada."
         return (
             f"OC {order.get('name') or po_name}: flujo {action_summary}. "
-            f"Recepcion confirmada y factura creada.{pickings_info}"
+            f"Recepcion confirmada y factura creada.{pickings_info}{inv_info}"
         )
     except xmlrpc.client.Fault as exc:
         logger.exception("Odoo Fault en finalize_invoice_workflow: %s", exc)
