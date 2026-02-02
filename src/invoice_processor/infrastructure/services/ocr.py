@@ -1,5 +1,7 @@
 import base64
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Union
 from PIL import Image
@@ -30,7 +32,7 @@ class InvoiceOcrClient:
         img = Image.open(image_path)
         width, height = img.size
         top_box = (0, 0, width, int(height * 0.35))
-        bottom_box = (0, int(height * 0.25), width, height)
+        bottom_box = (0, int(height * 0.35), width, height)
         header = img.crop(top_box)
         table = img.crop(bottom_box)
         combined_height = header.size[1] + table.size[1]
@@ -97,6 +99,29 @@ class InvoiceOcrClient:
             return payload
         warnings: List[str] = []
 
+        # Pass-through folio
+        folio_raw = payload.get("folio")
+        payload["folio"] = str(folio_raw).strip() if folio_raw else None
+
+        # Normalizar fecha_emision a YYYY-MM-DD
+        fecha_raw = payload.get("fecha_emision")
+        if fecha_raw and isinstance(fecha_raw, str):
+            fecha_raw = fecha_raw.strip()
+            parsed_date = None
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    parsed_date = datetime.strptime(fecha_raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            if parsed_date is not None:
+                payload["fecha_emision"] = parsed_date.strftime("%Y-%m-%d")
+            else:
+                warnings.append(f"fecha_emision no parseable: '{fecha_raw}'")
+                payload["fecha_emision"] = None
+        else:
+            payload["fecha_emision"] = None
+
         def _normalize_unit(unit: Any) -> str | None:
             if not unit:
                 return None
@@ -137,20 +162,33 @@ class InvoiceOcrClient:
             cleaned_line["precio_unitario"] = _round2(line.get("precio_unitario"))
             cleaned_line["unidad"] = _normalize_unit(line.get("unidad"))
             # Recalcula subtotal si difiere > $1 respecto de cantidad x precio.
+            # calc_sub es siempre qty * price SIN descuentos; los descuentos se aplican
+            # exclusivamente en _apply_line_discounts (processor.py).
             raw_sub = _round2(line.get("subtotal"))
             calc_sub = None
             if cleaned_line["cantidad"] is not None and cleaned_line["precio_unitario"] is not None:
                 calc_sub = round(cleaned_line["cantidad"] * cleaned_line["precio_unitario"], 2)
             descuento_monto = _round2(line.get("descuento_monto"))
             descuento_pct = _round2(line.get("descuento_pct"))
-            # Si hay descuento_pct y no hay descuento_monto explícito, aplícalo antes de decidir el subtotal.
-            if descuento_pct is not None and calc_sub is not None:
-                calc_sub = max(calc_sub * (1 - descuento_pct / 100.0), 0.0)
-            if descuento_monto and calc_sub is not None:
-                calc_sub = max(calc_sub - descuento_monto, 0.0)
-                cleaned_line["descuento_monto"] = descuento_monto
-            # Si hay diferencia > $1 y no hay descuento_monto que la explique, corrige al calc_sub.
-            if raw_sub is not None and calc_sub is not None and abs(calc_sub - raw_sub) > 1.0 and not descuento_monto:
+            # Calcula el subtotal esperado con descuentos SOLO para validar coherencia del OCR.
+            expected_discounted = calc_sub
+            if expected_discounted is not None and descuento_pct is not None:
+                expected_discounted = max(expected_discounted * (1 - descuento_pct / 100.0), 0.0)
+            if expected_discounted is not None and descuento_monto:
+                expected_discounted = max(expected_discounted - descuento_monto, 0.0)
+            # Si el raw_sub coincide con el valor descontado, el OCR ya reportó el subtotal
+            # con descuento incluido; almacenamos calc_sub (sin descuento) para que
+            # _apply_line_discounts lo aplique una sola vez.
+            has_discount = descuento_pct is not None or bool(descuento_monto)
+            raw_matches_discounted = (
+                raw_sub is not None
+                and expected_discounted is not None
+                and abs(expected_discounted - raw_sub) <= 1.0
+            )
+            if has_discount and raw_matches_discounted:
+                # El OCR ya incluyó el descuento en raw_sub; guardamos el subtotal sin descuento.
+                cleaned_line["subtotal"] = calc_sub
+            elif raw_sub is not None and calc_sub is not None and abs(calc_sub - raw_sub) > 1.0 and not has_discount:
                 detail_label = cleaned_line.get("detalle") or line.get("detalle")
                 if detail_label:
                     warnings.append(
@@ -185,37 +223,46 @@ class InvoiceOcrClient:
         Intenta parsear JSON dos veces; si ambas fallan, retorna {"error": "..."}.
         """
         attempts = [image_path]
-        # Si la primera pasada arroja dudoso, recorta y reintenta una vez.
-        raw = self._call_llm(image_path)
+        temp_files: List[str] = []
         try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-        except json.JSONDecodeError:
-            parsed = {"error": "json_invalid"}
-        post = self._postprocess_invoice_payload(parsed) if isinstance(parsed, dict) else parsed
-        if isinstance(post, dict) and post.get("ocr_dudoso"):
+            # Si la primera pasada arroja dudoso, recorta y reintenta una vez.
+            raw = self._call_llm(image_path)
             try:
-                cropped_path = self._crop_invoice(image_path)
-                attempts.append(cropped_path)
-            except Exception:
-                pass
-
-        for idx, attempt_path in enumerate(attempts):
-            if idx == 0 and post and not isinstance(post, dict):
-                continue
-            if idx > 0:
-                raw = self._call_llm(attempt_path)
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except json.JSONDecodeError:
+                parsed = {"error": "json_invalid"}
+            post = self._postprocess_invoice_payload(parsed) if isinstance(parsed, dict) else parsed
+            if isinstance(post, dict) and post.get("ocr_dudoso"):
                 try:
-                    parsed = json.loads(raw) if isinstance(raw, str) else raw
-                except json.JSONDecodeError:
-                    parsed = {"error": "json_invalid"}
-                post = self._postprocess_invoice_payload(parsed) if isinstance(parsed, dict) else parsed
-            try:
-                if isinstance(post, dict) and post.get("error"):
-                    if idx == len(attempts) - 1:
-                        return post
+                    cropped_path = self._crop_invoice(image_path)
+                    attempts.append(cropped_path)
+                    temp_files.append(cropped_path)
+                except Exception:
+                    pass
+
+            for idx, attempt_path in enumerate(attempts):
+                if idx == 0 and post and not isinstance(post, dict):
                     continue
-                return post
-            except Exception:
-                if idx == len(attempts) - 1:
-                    return {"error": "no_data"}
-                continue
+                if idx > 0:
+                    raw = self._call_llm(attempt_path)
+                    try:
+                        parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    except json.JSONDecodeError:
+                        parsed = {"error": "json_invalid"}
+                    post = self._postprocess_invoice_payload(parsed) if isinstance(parsed, dict) else parsed
+                try:
+                    if isinstance(post, dict) and post.get("error"):
+                        if idx == len(attempts) - 1:
+                            return post
+                        continue
+                    return post
+                except Exception:
+                    if idx == len(attempts) - 1:
+                        return {"error": "no_data"}
+                    continue
+        finally:
+            for tmp in temp_files:
+                try:
+                    Path(tmp).unlink(missing_ok=True)
+                except Exception:
+                    pass

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import concurrent.futures
 import logging
 import os
 import re
@@ -14,6 +15,9 @@ from .embedding_service import EmbeddingService, choose_best_match_with_fallback
 from rich.traceback import install
 
 install()
+
+_XMLRPC_TIMEOUT_SECONDS = 30
+_xmlrpc_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 if TYPE_CHECKING:
     from ...core.models import InvoiceLine
@@ -503,12 +507,14 @@ class OdooConnectionManager:
     def _execute_kw(self, model, method, args=None, kwargs=None):
         """Atajo para llamar XML-RPC usando el product_client actual.
         Si es una lectura, aplana posibles listas anidadas de IDs para evitar errores de hash.
+        Ejecuta con timeout para evitar bloqueos indefinidos.
         """
         client = self.get_product_client()
         safe_args = args or []
         if method == "read" and safe_args and isinstance(safe_args[0], list):
             safe_args = [self._normalize_id_list(safe_args[0])] + list(safe_args[1:])
-        return client.models.execute_kw(
+        future = _xmlrpc_executor.submit(
+            client.models.execute_kw,
             client.db,
             client.uid,
             client.password,
@@ -517,6 +523,13 @@ class OdooConnectionManager:
             safe_args,
             kwargs or {},
         )
+        try:
+            return future.result(timeout=_XMLRPC_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"La llamada XML-RPC a Odoo ({model}.{method}) excedió el timeout de {_XMLRPC_TIMEOUT_SECONDS}s."
+            )
 
     @staticmethod
     def _build_or_domain(conditions: List[Tuple[str, str, Any]]) -> List[Any]:
@@ -2520,9 +2533,52 @@ class OdooConnectionManager:
                     "No se pudo validar picking %s: %s", picking_id, exc
                 )
     
-    def create_invoice_for_order(self, order_id: int) -> None:
-        """Genera la factura desde la orden de compra."""
+    def create_invoice_for_order(
+        self, order_id: int, ref: str | None = None, invoice_date: str | None = None
+    ) -> dict:
+        """Genera la factura desde la orden de compra, la publica con ref y fecha."""
+        # Leer facturas existentes antes de crear
+        order_before = self._execute_kw(
+            "purchase.order", "read", [[order_id]], {"fields": ["invoice_ids"]}
+        )
+        existing_ids = set(
+            self._normalize_id_list(order_before[0].get("invoice_ids", []))
+            if order_before
+            else []
+        )
+
         self._execute_kw("purchase.order", "action_create_invoice", [[order_id]])
+
+        # Releer para detectar nuevas facturas
+        order_after = self._execute_kw(
+            "purchase.order", "read", [[order_id]], {"fields": ["invoice_ids"]}
+        )
+        all_ids = set(
+            self._normalize_id_list(order_after[0].get("invoice_ids", []))
+            if order_after
+            else []
+        )
+        new_invoice_ids = list(all_ids - existing_ids)
+
+        posted = False
+        for inv_id in new_invoice_ids:
+            vals: dict[str, Any] = {}
+            if ref:
+                vals["ref"] = ref
+            if invoice_date:
+                vals["invoice_date"] = invoice_date
+            if vals:
+                try:
+                    self._execute_kw("account.move", "write", [[inv_id], vals])
+                except Exception as exc:
+                    logger.warning("No se pudo escribir ref/fecha en factura %s: %s", inv_id, exc)
+            try:
+                self._execute_kw("account.move", "action_post", [[inv_id]])
+                posted = True
+            except Exception as exc:
+                logger.warning("No se pudo publicar factura %s: %s", inv_id, exc)
+
+        return {"invoice_ids": new_invoice_ids, "posted": posted}
 
 
 odoo_manager = OdooConnectionManager()
