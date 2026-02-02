@@ -4,6 +4,8 @@ INVOICE_OCR_PROMPT = (
     "{\n"
     '  "supplier_name": string|null,\n'
     '  "supplier_rut": string|null,\n'
+    '  "folio": string|null,\n'
+    '  "fecha_emision": string|null,\n'
     '  "neto": number,\n'
     '  "iva_19": number,\n'
     '  "total": number,\n'
@@ -21,4 +23,6 @@ INVOICE_OCR_PROMPT = (
     "7. Captura el descuento por línea en 'descuento_pct' (porcentaje) cuando exista; si no aparece, usa null. Si el documento muestra un monto de descuento por línea, usa 'descuento_monto'; de lo contrario, usa null.\n"
     "8. Si aparece el RUT del proveedor, repórtalo en 'supplier_rut' (ej: 12.345.678-9). Si no se puede leer, usa null.\n"
     "9. Lee solo la tabla de la factura y descarta papeles, tickets u otros objetos visibles; si la imagen es ilegible, responde {'error': 'no_data'}.\n"
+    "10. Captura el numero de folio (N° Folio, Folio, N° documento) en 'folio'. Si no se lee, usa null.\n"
+    "11. Captura la fecha de emision en 'fecha_emision' con formato YYYY-MM-DD. Si no se lee, usa null.\n"
 )

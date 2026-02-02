@@ -8,7 +8,7 @@ class InvoiceLine(BaseModel):
     default_code: Optional[str] = Field(
         default=None, description="SKU/default_code del producto en Odoo (si está disponible)"
     )
-    cantidad: float = Field(..., gt=0, description="Cantidad facturada (CANT)")
+    cantidad: float = Field(..., ge=0, description="Cantidad facturada (CANT)")
     precio_unitario: float = Field(..., description="Precio unitario (P. UNITARIO)")
     subtotal: float = Field(..., description="Total por línea (columna TOTAL junto a P. UNITARIO)")
     unidad: Optional[str] = Field(
@@ -30,6 +30,12 @@ class InvoiceData(BaseModel):
     )
     supplier_rut: Optional[str] = Field(
         default=None, description="RUT/tax_id del proveedor según la factura"
+    )
+    folio: Optional[str] = Field(
+        default=None, description="Numero de folio de la factura"
+    )
+    fecha_emision: Optional[str] = Field(
+        default=None, description="Fecha de emision (YYYY-MM-DD)"
     )
     ocr_dudoso: bool = Field(
         default=False, description="True si el OCR detecta incoherencias internas en montos"

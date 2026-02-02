@@ -2,6 +2,7 @@ from pathlib import Path
 from queue import Queue
 import logging
 import re
+import time
 import requests
 from langchain_core.messages import SystemMessage, HumanMessage
 from rich.logging import RichHandler
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 SLACK_REACTION_URL = "https://slack.com/api/reactions.add"
 SLACK_HISTORY_URL = "https://slack.com/api/conversations.history"
+_RATE_LIMIT_SECONDS = 10
+_last_submission: dict[str, float] = {}
 
 
 def configure_logging() -> None:
@@ -76,10 +79,12 @@ def run_slack_bot():
 
     while True:
         payload = message_queue.get()
-        user_id = payload.get("user") or payload.get("user_id")
         event = payload.get("event") or payload  # algunos adaptadores entregan el evento anidado
         inner_message = event.get("message") or {}
         previous_message = inner_message.get("previous_message", {}) or event.get("previous_message", {}) or {}
+
+        # Datos base del evento
+        user_id = event.get("user") or event.get("user_id") or inner_message.get("user") or previous_message.get("user")
 
         # Filtro de usuarios autorizados
         if allowed.get("enabled"):
@@ -87,9 +92,6 @@ def run_slack_bot():
             if user_id not in allowed_ids:
                 logger.info("Usuario no autorizado: %s; se ignora el evento", user_id)
                 continue
-
-        # Datos base del evento
-        user_id = event.get("user") or event.get("user_id") or inner_message.get("user") or previous_message.get("user")
         bot_id = event.get("bot_id") or inner_message.get("bot_id")
         subtype = event.get("subtype")
         hidden = event.get("hidden")
@@ -175,6 +177,15 @@ def run_slack_bot():
                 logger.exception("No se pudo descargar el archivo de Slack")
                 post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
                 continue
+            # Rate limit: solo para envíos con archivo adjunto.
+            if user_id:
+                now = time.monotonic()
+                last_ts = _last_submission.get(user_id)
+                if last_ts is not None and (now - last_ts) < _RATE_LIMIT_SECONDS:
+                    logger.info("Rate limit: usuario %s envió otra factura muy rápido; ignorando.", user_id)
+                    post_message(channel, "Espera unos segundos antes de enviar otra factura.", timestamp)
+                    continue
+                _last_submission[user_id] = now
 
         if not file_path:
             logger.warning("No se pudo determinar la ruta del archivo para el evento; se solicita nueva factura.")
@@ -268,6 +279,14 @@ def run_slack_bot():
             except Exception as exc:
                 logger.error("No se pudo enviar mensaje a Slack: %s", exc)
                 logger.debug("Respuesta que falló: %s", response)
+            # Limpiar archivo temporal: el flujo terminó, ya no se reutilizará.
+            if user_id and user_id in last_file_by_thread:
+                old_file = last_file_by_thread.pop(user_id, None)
+                if old_file and old_file.exists():
+                    try:
+                        old_file.unlink()
+                    except Exception:
+                        logger.debug("No se pudo eliminar archivo temporal %s", old_file)
             continue
         else:
             try:
@@ -415,4 +434,3 @@ def _is_affirmative(text: str) -> bool:
     }:
         return True
     return False
-    return None

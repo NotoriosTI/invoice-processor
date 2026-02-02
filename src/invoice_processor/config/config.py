@@ -106,5 +106,6 @@ def is_user_allowed(user_id: str) -> bool:
     return any(user_id == u.get("id") for u in info.get("users", []))
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
