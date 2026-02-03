@@ -132,6 +132,7 @@ class OdooConnectionManager:
             return int(supplier_id)
         supplier_label = (supplier_name or "").strip()
         normalized_rut = self._normalize_vat_strict(supplier_rut)
+        canonical_rut = self._normalize_rut_cl(supplier_rut)
         raw_rut = supplier_rut.strip() if isinstance(supplier_rut, str) else None
 
         conditions: List[Tuple[str, str, Any]] = []
@@ -139,7 +140,9 @@ class OdooConnectionManager:
             conditions.append(("name", "ilike", supplier_label))
         if normalized_rut:
             conditions.append(("vat", "ilike", normalized_rut))
-        if raw_rut and raw_rut != normalized_rut:
+        if canonical_rut and canonical_rut != normalized_rut:
+            conditions.append(("vat", "ilike", canonical_rut))
+        if raw_rut and raw_rut != normalized_rut and raw_rut != canonical_rut:
             conditions.append(("vat", "ilike", raw_rut))
 
         if not conditions:
@@ -547,6 +550,21 @@ class OdooConnectionManager:
             cleaned = cleaned[2:]
         cleaned = "".join(ch for ch in cleaned if ch.isalnum())
         return cleaned or None
+
+    @staticmethod
+    def _normalize_rut_cl(vat: Optional[str]) -> Optional[str]:
+        """Normalizes a Chilean RUT to canonical format with hyphen before check digit (e.g. '12345678-9')."""
+        if not vat:
+            return None
+        cleaned = vat.strip().upper()
+        if cleaned.startswith("CL"):
+            cleaned = cleaned[2:]
+        cleaned = "".join(ch for ch in cleaned if ch.isalnum())
+        if not cleaned:
+            return None
+        if len(cleaned) >= 2:
+            return f"{cleaned[:-1]}-{cleaned[-1]}"
+        return cleaned
 
     def _normalize_vat(self, vat: Optional[str]) -> Optional[str]:
         return self._normalize_vat_strict(vat)
@@ -2085,13 +2103,16 @@ class OdooConnectionManager:
     def _find_or_create_supplier(self, supplier_name: str, supplier_rut: Optional[str] = None) -> int:
         supplier_label = (supplier_name or "Proveedor Desconocido").strip()
         normalized_rut = self._normalize_vat_strict(supplier_rut)
+        canonical_rut = self._normalize_rut_cl(supplier_rut)
         raw_rut = supplier_rut.strip() if isinstance(supplier_rut, str) else None
         conditions: List[Tuple[str, str, Any]] = []
         if supplier_label:
             conditions.append(("name", "ilike", supplier_label))
         if normalized_rut:
             conditions.append(("vat", "ilike", normalized_rut))
-        if raw_rut and raw_rut != normalized_rut:
+        if canonical_rut and canonical_rut != normalized_rut:
+            conditions.append(("vat", "ilike", canonical_rut))
+        if raw_rut and raw_rut != normalized_rut and raw_rut != canonical_rut:
             conditions.append(("vat", "ilike", raw_rut))
         domain = self._build_or_domain(conditions)
         try:
@@ -2154,7 +2175,9 @@ class OdooConnectionManager:
         )
         try:
             values = {"name": supplier_label, "company_type": "company", "supplier_rank": 1}
-            if normalized_rut:
+            if canonical_rut:
+                values["vat"] = canonical_rut
+            elif normalized_rut:
                 values["vat"] = normalized_rut
             return self._execute_kw(
                 "res.partner",
@@ -2182,6 +2205,9 @@ class OdooConnectionManager:
         def _create_lines_via_xmlrpc(order_id: int, lines_payload: List[dict]) -> None:
             for payload in lines_payload:
                 payload["order_id"] = order_id
+                raw_taxes = payload.get("taxes_id") or []
+                if raw_taxes and not (isinstance(raw_taxes[0], (list, tuple))):
+                    payload["taxes_id"] = [(6, 0, self._normalize_id_list(raw_taxes))]
                 self._execute_kw("purchase.order.line", "create", [[payload]])
 
         partner_id = self._find_or_create_supplier(invoice.supplier_name or "Proveedor Desconocido", getattr(invoice, "supplier_rut", None))
@@ -2252,7 +2278,15 @@ class OdooConnectionManager:
                     "order_line": [],
                 }
                 order_id = _create_order_via_xmlrpc(order_vals)
-                _create_lines_via_xmlrpc(order_id, line_values)
+                try:
+                    _create_lines_via_xmlrpc(order_id, line_values)
+                except Exception as lines_exc:
+                    logger.error("Fallo al crear líneas para orden %s; eliminando orden huérfana: %s", order_id, lines_exc)
+                    try:
+                        self._execute_kw("purchase.order", "unlink", [[order_id]])
+                    except Exception as unlink_exc:
+                        logger.warning("No se pudo eliminar la orden huérfana %s: %s", order_id, unlink_exc)
+                    raise
                 logger.info("Orden creada vía XML-RPC fallback (ID %s) tras fallo en OdooSupply.", order_id)
                 try:
                     order = self.confirm_purchase_order(order_id)
@@ -2278,8 +2312,8 @@ class OdooConnectionManager:
         picking_ids = self._normalize_id_list(order.get("picking_ids", []))
         if not picking_ids:
             return
-        dest_mp_me = self._get_location_id_by_name("JS/Stock/Materia Prima y Envases")
-        dest_pt = self._get_location_id_by_name("JS/Stock")
+        dest_mp_me = self._get_location_id_by_name(self._settings.odoo_stock_location_mp_me)
+        dest_pt = self._get_location_id_by_name(self._settings.odoo_stock_location_default)
         if dest_mp_me is None:
             raise RuntimeError(
                 "No se encontro la ubicacion 'JS/Stock/Materia Prima y Envases' en Odoo."
@@ -2568,6 +2602,20 @@ class OdooConnectionManager:
                     "No se pudo validar picking %s: %s", picking_id, exc
                 )
     
+    @staticmethod
+    def _normalize_date_for_odoo(date_str: str | None) -> str | None:
+        """Converts recognized date formats to YYYY-MM-DD for Odoo."""
+        if not date_str or not isinstance(date_str, str):
+            return None
+        date_str = date_str.strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        logger.warning("Fecha no parseable para Odoo: '%s'", date_str)
+        return None
+
     def create_invoice_for_order(
         self, order_id: int, ref: str | None = None, invoice_date: str | None = None
     ) -> dict:
@@ -2601,7 +2649,9 @@ class OdooConnectionManager:
             if ref:
                 vals["ref"] = ref
             if invoice_date:
-                vals["invoice_date"] = invoice_date
+                normalized_date = self._normalize_date_for_odoo(invoice_date)
+                if normalized_date:
+                    vals["invoice_date"] = normalized_date
             if vals:
                 try:
                     self._execute_kw("account.move", "write", [[inv_id], vals])

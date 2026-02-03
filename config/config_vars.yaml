@@ -63,6 +63,16 @@ variables:
     type: str
     default: ""
 
+  ODOO_STOCK_LOCATION_MP_ME:
+    source: ODOO_STOCK_LOCATION_MP_ME
+    type: str
+    default: "JS/Stock/Materia Prima y Envases"
+
+  ODOO_STOCK_LOCATION_DEFAULT:
+    source: ODOO_STOCK_LOCATION_DEFAULT
+    type: str
+    default: "JS/Stock"
+
   DATA_PATH:
     source: DATA_PATH
     type: str
@@ -87,4 +97,6 @@ validation:
     - LANGSMITH_API_KEY
     - LANGSMITH_PROJECT
     - LANGSMITH_PROJECT_ID
+    - ODOO_STOCK_LOCATION_MP_ME
+    - ODOO_STOCK_LOCATION_DEFAULT
   strict: false

@@ -536,10 +536,12 @@ def receive_order_by_sku_prefix(po_name: str) -> str:
         if not active_pickings:
             return f"OC {order_name}: Sin recepciones pendientes."
 
+        from ..config import get_settings as _get_settings
+        _settings = _get_settings()
         dest_mp_me = _resolve_location_id_by_complete_name(
-            "JS/Stock/Materia Prima y Envases"
+            _settings.odoo_stock_location_mp_me
         )
-        dest_stock = _resolve_location_id_by_complete_name("JS/Stock")
+        dest_stock = _resolve_location_id_by_complete_name(_settings.odoo_stock_location_default)
         has_move_qty_done = _stock_move_has_quantity_done()
 
         picking_moves: dict[int, list[dict]] = {}
