@@ -608,7 +608,7 @@ def receive_order_by_sku_prefix(po_name: str) -> str:
                 sku_norm = (
                     odoo_manager._sanitize_default_code(sku_raw) if sku_raw else None
                 )
-                if not sku_norm:
+                if not sku_norm or not isinstance(sku_norm, str):
                     if prod_id is not None:
                         logger.warning(
                             "Producto %s sin SKU; se usara destino JS/Stock.", prod_id

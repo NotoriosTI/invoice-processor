@@ -2496,7 +2496,7 @@ class OdooConnectionManager:
                 prod_id = self._normalize_id(mv.get("product_id"))
                 sku_raw = product_skus.get(prod_id)
                 sku_norm = self._sanitize_default_code(sku_raw) if sku_raw else None
-                if not sku_norm:
+                if not sku_norm or not isinstance(sku_norm, str):
                     logger.warning(
                         "Producto %s sin SKU; se usara destino JS/Stock.", prod_id
                     )
@@ -2695,6 +2695,20 @@ class OdooConnectionManager:
         self, order_id: int, ref: str | None = None, invoice_date: str | None = None
     ) -> dict:
         """Genera la factura desde la orden de compra, la publica con ref y fecha."""
+        # Verificar si la orden ya está facturada para evitar crear facturas duplicadas.
+        order_check = self._execute_kw(
+            "purchase.order", "read", [[order_id]], {"fields": ["invoice_status", "invoice_ids"]}
+        )
+        if order_check:
+            inv_status = str(order_check[0].get("invoice_status") or "").lower()
+            if inv_status in {"invoiced", "facturado"}:
+                existing = self._normalize_id_list(order_check[0].get("invoice_ids", []))
+                logger.info(
+                    "La orden %s ya está facturada (invoice_status=%s). Facturas existentes: %s",
+                    order_id, inv_status, existing,
+                )
+                return {"invoice_ids": existing, "posted": True}
+
         # Leer facturas existentes antes de crear
         order_before = self._execute_kw(
             "purchase.order", "read", [[order_id]], {"fields": ["invoice_ids"]}
