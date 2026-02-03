@@ -15,7 +15,7 @@ init_config(
     gcp_project_id=None,
     strict=None,
     dotenv_path=None,
-    debug=False,
+    debug=True,
 )
 
 DATA_PATH = Path(get_config("DATA_PATH"))

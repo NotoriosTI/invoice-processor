@@ -1,15 +1,17 @@
+import json
 from pathlib import Path
 from queue import Queue
 import logging
 import re
 import time
+import uuid
 import requests
 from langchain_core.messages import SystemMessage, HumanMessage
 from rich.logging import RichHandler
 from rich.traceback import install
 
 from .slack_bot import SlackBot
-from ..config import get_settings, load_allowed_users
+from ..config import get_settings, load_allowed_users, DATA_PATH
 from ..prompts import INVOICE_PROMPT
 from ..agents.agent import invoice_agent
 from ..core.models import InvoiceResponseModel
@@ -21,6 +23,30 @@ SLACK_REACTION_URL = "https://slack.com/api/reactions.add"
 SLACK_HISTORY_URL = "https://slack.com/api/conversations.history"
 _RATE_LIMIT_SECONDS = 10
 _last_submission: dict[str, float] = {}
+MAX_INTERACTION_ROUNDS = 10
+
+_STATUS_MAP_PATH = DATA_PATH / "thread_status.json"
+
+
+def _load_status_map() -> dict[str, str]:
+    """Carga el mapa de status desde disco. Retorna {} si no existe o está corrupto."""
+    try:
+        if _STATUS_MAP_PATH.exists():
+            return json.loads(_STATUS_MAP_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        logger.warning("No se pudo leer %s; se inicia vacío.", _STATUS_MAP_PATH)
+    return {}
+
+
+def _save_status_map(status_map: dict[str, str]) -> None:
+    """Persiste el mapa de status a disco."""
+    try:
+        _STATUS_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _STATUS_MAP_PATH.write_text(
+            json.dumps(status_map, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("No se pudo guardar status map: %s", exc)
 
 
 def configure_logging() -> None:
@@ -67,7 +93,9 @@ def run_slack_bot():
     allowed = load_allowed_users()
     message_queue = Queue()
     last_file_by_thread: dict[str, Path] = {}
-    last_status_by_thread: dict[str, str] = {}
+    last_status_by_thread: dict[str, str] = _load_status_map()
+    thread_id_by_user: dict[str, str] = {}
+    interaction_count_by_thread: dict[str, int] = {}
     slack_bot = SlackBot(
         app_token=settings.slack_app_token,
         bot_token=settings.slack_bot_token,
@@ -185,6 +213,7 @@ def run_slack_bot():
                 files = fetched_files
 
         file_path: Path | None = None
+        has_new_file = False
         if not files:
             # Reusar la última factura del thread si existe
             file_path = last_file_by_thread.get(user_id) if user_id else None
@@ -206,6 +235,7 @@ def run_slack_bot():
                 file_path = download_file(file_info, Path("/tmp/invoices") / (user_id or "unknown"))
                 if user_id:
                     last_file_by_thread[user_id] = file_path
+                    has_new_file = True
             except Exception as exc:
                 logger.exception("No se pudo descargar el archivo de Slack")
                 post_message(channel, f"No pude descargar la factura: {exc}", timestamp)
@@ -224,7 +254,20 @@ def run_slack_bot():
             logger.warning("No se pudo determinar la ruta del archivo para el evento; se solicita nueva factura.")
             post_message(channel, "Necesito que adjuntes una factura en formato PNG/JPG.", timestamp)
             continue
-        config = {"configurable": {"thread_id": user_id}}
+
+        # --- Thread isolation por sesión de factura ---
+        if user_id:
+            if has_new_file:
+                # Nuevo archivo: generar nuevo thread_id para aislar la sesión
+                thread_id_by_user[user_id] = f"{user_id}_{uuid.uuid4().hex[:8]}"
+                interaction_count_by_thread[user_id] = 0
+            elif user_id not in thread_id_by_user:
+                # Sin thread previo y sin archivo nuevo: crear thread de todas formas
+                thread_id_by_user[user_id] = f"{user_id}_{uuid.uuid4().hex[:8]}"
+                interaction_count_by_thread.setdefault(user_id, 0)
+
+        current_thread_id = thread_id_by_user.get(user_id, user_id)
+        config = {"configurable": {"thread_id": current_thread_id}}
 
         state = invoice_agent.get_state(config)
         is_new_thread = state is None or not state.values.get("messages")
@@ -252,14 +295,38 @@ def run_slack_bot():
                 timestamp,
             )
             continue
+
+        # --- Loop detection ---
+        if user_id:
+            interaction_count_by_thread[user_id] = interaction_count_by_thread.get(user_id, 0) + 1
+            if interaction_count_by_thread[user_id] > MAX_INTERACTION_ROUNDS:
+                logger.warning(
+                    "Usuario %s excedió el máximo de %d interacciones para el thread %s. Reseteando.",
+                    user_id, MAX_INTERACTION_ROUNDS, current_thread_id,
+                )
+                post_message(
+                    channel,
+                    f"Se excedió el máximo de {MAX_INTERACTION_ROUNDS} interacciones para esta factura. "
+                    "El flujo se ha reiniciado. Por favor, sube la factura nuevamente.",
+                    timestamp,
+                )
+                thread_id_by_user.pop(user_id, None)
+                last_status_by_thread.pop(user_id, None)
+                _save_status_map(last_status_by_thread)
+                interaction_count_by_thread.pop(user_id, None)
+                last_file_by_thread.pop(user_id, None)
+                continue
+
         # Prefiere la respuesta estructurada del modelo si existe; evita la conversación interna.
         response_model: InvoiceResponseModel | None = _coerce_response_model(result)
         if response_model:
             needs_follow_up = bool(response_model.needs_follow_up)
             if response_model.status:
                 last_status_by_thread[user_id] = response_model.status
+                _save_status_map(last_status_by_thread)
             else:
                 last_status_by_thread.pop(user_id, None)
+                _save_status_map(last_status_by_thread)
             if needs_follow_up and response_model.status == "WAITING_FOR_HUMAN" and response_model.products:
                 first = response_model.products[0]
                 supplier_name = getattr(first, "supplier_name", None) or "Desconocido"
@@ -312,14 +379,18 @@ def run_slack_bot():
             except Exception as exc:
                 logger.error("No se pudo enviar mensaje a Slack: %s", exc)
                 logger.debug("Respuesta que falló: %s", response)
-            # Limpiar archivo temporal: el flujo terminó, ya no se reutilizará.
-            if user_id and user_id in last_file_by_thread:
+            # Limpiar estado: el flujo terminó exitosamente.
+            if user_id:
                 old_file = last_file_by_thread.pop(user_id, None)
                 if old_file and old_file.exists():
                     try:
                         old_file.unlink()
                     except Exception:
                         logger.debug("No se pudo eliminar archivo temporal %s", old_file)
+                thread_id_by_user.pop(user_id, None)
+                last_status_by_thread.pop(user_id, None)
+                _save_status_map(last_status_by_thread)
+                interaction_count_by_thread.pop(user_id, None)
             continue
         else:
             try:

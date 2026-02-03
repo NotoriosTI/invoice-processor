@@ -40,5 +40,9 @@ COPY config/ config/
 # Copia el directorio de tests para los health checks
 COPY tests/ tests/
 
+# Crear directorio de datos persistentes
+RUN mkdir -p /app/data
+ENV DATA_PATH=/app/data
+
 # Corre la aplicación directamente con Python, ya que las dependencias están en el path global
 CMD ["python", "-m", "invoice_processor.app.main", "--mode", "slack"]

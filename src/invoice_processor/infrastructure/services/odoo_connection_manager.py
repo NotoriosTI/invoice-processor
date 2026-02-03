@@ -1677,27 +1677,60 @@ class OdooConnectionManager:
         if "product_name" not in fields:
             return None
         partner_field = self._supplierinfo_partner_field()
+        read_fields = ["id", partner_field, "product_name", self._supplierinfo_product_field()]
+        supplier_id_norm = self._normalize_id(supplier_id)
+        supplier_domain = [partner_field, "=", supplier_id_norm]
+
+        # Intento 1: match exacto (o ilike si partial=True)
         op = "ilike" if partial else "="
-        domain = [
-            [partner_field, "=", self._normalize_id(supplier_id)],
-            ["product_name", op, invoice_detail],
-        ]
+        domain = [supplier_domain, ["product_name", op, invoice_detail]]
         try:
             records = self._execute_kw(
-                "product.supplierinfo",
-                "search_read",
-                [domain],
-                {"fields": ["id", partner_field, "product_name", self._supplierinfo_product_field()]},
+                "product.supplierinfo", "search_read", [domain], {"fields": read_fields},
             )
         except Exception as exc:
             logger.warning("No se pudo leer supplierinfo para mapeo '%s': %s", invoice_detail, exc)
             return None
-        if not records:
-            return None
-        product_id = self._product_id_from_supplierinfo_record(records[0])
-        if product_id:
-            logger.info("Producto obtenido desde mapeo supplierinfo: %s -> product_id %s", invoice_detail, product_id)
-        return product_id
+        if records:
+            product_id = self._product_id_from_supplierinfo_record(records[0])
+            if product_id:
+                logger.info("Producto obtenido desde mapeo supplierinfo (exact): %s -> product_id %s", invoice_detail, product_id)
+            return product_id
+
+        # Intento 2: ilike (case-insensitive) si el primer intento fue exacto
+        if not partial:
+            domain_ilike = [supplier_domain, ["product_name", "ilike", invoice_detail]]
+            try:
+                records = self._execute_kw(
+                    "product.supplierinfo", "search_read", [domain_ilike], {"fields": read_fields},
+                )
+            except Exception as exc:
+                logger.warning("No se pudo leer supplierinfo (ilike) para mapeo '%s': %s", invoice_detail, exc)
+                return None
+            if records:
+                product_id = self._product_id_from_supplierinfo_record(records[0])
+                if product_id:
+                    logger.info("Producto obtenido desde mapeo supplierinfo (ilike): %s -> product_id %s", invoice_detail, product_id)
+                return product_id
+
+        # Intento 3: normalizar whitespace e ilike
+        normalized_detail = re.sub(r"\s+", " ", invoice_detail.strip())
+        if normalized_detail != invoice_detail:
+            domain_norm = [supplier_domain, ["product_name", "ilike", normalized_detail]]
+            try:
+                records = self._execute_kw(
+                    "product.supplierinfo", "search_read", [domain_norm], {"fields": read_fields},
+                )
+            except Exception as exc:
+                logger.warning("No se pudo leer supplierinfo (normalized) para mapeo '%s': %s", normalized_detail, exc)
+                return None
+            if records:
+                product_id = self._product_id_from_supplierinfo_record(records[0])
+                if product_id:
+                    logger.info("Producto obtenido desde mapeo supplierinfo (normalized): %s -> product_id %s", normalized_detail, product_id)
+                return product_id
+
+        return None
 
     def ensure_product_for_supplier(
         self,
@@ -1965,6 +1998,8 @@ class OdooConnectionManager:
         """Registra la decisión humana asociando el detalle de factura a un product_id en supplierinfo."""
         if not invoice_product_name:
             raise ValueError("invoice_product_name es requerido para mapear el producto.")
+        # Normalizar whitespace para consistencia entre lo que se guarda y lo que se busca
+        invoice_product_name = re.sub(r"\s+", " ", invoice_product_name.strip())
         product_id = self._normalize_id(odoo_product_id) if odoo_product_id is not None else None
         supplier_id_norm = self._normalize_id(supplier_id)
         default_code = self._sanitize_default_code(default_code)
