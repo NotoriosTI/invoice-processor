@@ -59,6 +59,14 @@ class InvoiceOcrClient:
 
     @staticmethod
     def _to_float(value: Any) -> float | None:
+        """Convert a string/numeric value to float.
+
+        Assumes CLP (Chilean Pesos) where amounts are integers and '.' followed
+        by exactly 3 digits is a thousands separator (e.g. '1.500' = 1500),
+        while '.' followed by 2 digits is a decimal separator (e.g. '15.50' = 15.5).
+        Commas are treated as decimal separators unless both ',' and '.' are present,
+        in which case the Latin format is assumed (dot=thousands, comma=decimal).
+        """
         if value is None:
             return None
         if isinstance(value, (int, float)):
@@ -108,7 +116,7 @@ class InvoiceOcrClient:
         if fecha_raw and isinstance(fecha_raw, str):
             fecha_raw = fecha_raw.strip()
             parsed_date = None
-            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d"):
                 try:
                     parsed_date = datetime.strptime(fecha_raw, fmt)
                     break
@@ -215,54 +223,42 @@ class InvoiceOcrClient:
                 # Duda leve: avisar pero permitir continuar sin bloquear.
                 warnings.append(f"suma lineas {sum_subtotales} vs neto cabecera {neto}")
         if warnings:
-            payload["ocr_warning"] = " ; ".join(warnings)
+            payload["ocr_warning"] = "; ".join(warnings)
         return payload
+
+    def _attempt_extract(self, image_path: str) -> Dict[str, Any]:
+        """Single extraction attempt: call LLM + postprocess."""
+        raw = self._call_llm(image_path)
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            return {"error": "json_invalid"}
+        if not isinstance(parsed, dict):
+            return {"error": "no_data"}
+        return self._postprocess_invoice_payload(parsed)
 
     def extract(self, image_path: str) -> Union[str, Dict[str, Any]]:
         """
-        Intenta parsear JSON dos veces; si ambas fallan, retorna {"error": "..."}.
+        Intenta extraer datos de factura. Si el primer intento es dudoso,
+        recorta la imagen y reintenta una vez; retorna el mejor resultado.
         """
-        attempts = [image_path]
-        temp_files: List[str] = []
+        cropped_path: str | None = None
         try:
-            # Si la primera pasada arroja dudoso, recorta y reintenta una vez.
-            raw = self._call_llm(image_path)
-            try:
-                parsed = json.loads(raw) if isinstance(raw, str) else raw
-            except json.JSONDecodeError:
-                parsed = {"error": "json_invalid"}
-            post = self._postprocess_invoice_payload(parsed) if isinstance(parsed, dict) else parsed
-            if isinstance(post, dict) and post.get("ocr_dudoso"):
+            result = self._attempt_extract(image_path)
+
+            if isinstance(result, dict) and result.get("ocr_dudoso"):
                 try:
                     cropped_path = self._crop_invoice(image_path)
-                    attempts.append(cropped_path)
-                    temp_files.append(cropped_path)
+                    cropped_result = self._attempt_extract(cropped_path)
+                    if isinstance(cropped_result, dict) and not cropped_result.get("error"):
+                        return cropped_result
                 except Exception:
                     pass
 
-            for idx, attempt_path in enumerate(attempts):
-                if idx == 0 and post and not isinstance(post, dict):
-                    continue
-                if idx > 0:
-                    raw = self._call_llm(attempt_path)
-                    try:
-                        parsed = json.loads(raw) if isinstance(raw, str) else raw
-                    except json.JSONDecodeError:
-                        parsed = {"error": "json_invalid"}
-                    post = self._postprocess_invoice_payload(parsed) if isinstance(parsed, dict) else parsed
-                try:
-                    if isinstance(post, dict) and post.get("error"):
-                        if idx == len(attempts) - 1:
-                            return post
-                        continue
-                    return post
-                except Exception:
-                    if idx == len(attempts) - 1:
-                        return {"error": "no_data"}
-                    continue
+            return result
         finally:
-            for tmp in temp_files:
+            if cropped_path:
                 try:
-                    Path(tmp).unlink(missing_ok=True)
+                    Path(cropped_path).unlink(missing_ok=True)
                 except Exception:
                     pass
