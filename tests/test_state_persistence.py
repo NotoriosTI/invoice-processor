@@ -291,19 +291,19 @@ class TestMappedProductIdFallback:
 
     @patch("invoice_processor.infrastructure.services.odoo_connection_manager.OdooConnectionManager._execute_kw")
     def test_whitespace_normalized_match(self, mock_exec):
-        """Espacios dobles se resuelven con normalización + ilike."""
+        """Espacios dobles se resuelven porque el whitespace se normaliza al inicio."""
         manager = self._make_manager()
         manager._execute_kw = mock_exec
         mock_exec.side_effect = [
-            [],  # exact → no match
-            [],  # ilike → no match (whitespace aún difiere en Odoo PostgreSQL)
-            [SAMPLE_SUPPLIERINFO_RECORD],  # normalized + ilike → match
+            [],  # exact → no match (whitespace already normalized at start)
+            [SAMPLE_SUPPLIERINFO_RECORD],  # ilike → match (normalized input)
         ]
 
         result = manager.get_mapped_product_id("Aceite  de  Monoi  ORIGINAL", 99)
 
         assert result == 10
-        assert mock_exec.call_count == 3
+        # Whitespace is normalized at the start, so only exact + ilike attempts are needed.
+        assert mock_exec.call_count == 2
 
     @patch("invoice_processor.infrastructure.services.odoo_connection_manager.OdooConnectionManager._execute_kw")
     def test_no_match_returns_none(self, mock_exec):

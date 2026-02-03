@@ -404,11 +404,11 @@ class TestE2EIlikeFallbackIntegration:
         manager._product_id_from_supplierinfo_record = MagicMock(return_value=42)
 
         mock_exec.side_effect = [
-            [],  # exact
-            [],  # ilike
+            [],  # exact (whitespace already normalized at start)
             [{"id": 1, "partner_id": [99, "P"], "product_name": "Aceite de Monoi ORIGINAL", "product_tmpl_id": [42, "T"]}],
         ]
 
         result = manager.get_mapped_product_id("Aceite  de  Monoi  ORIGINAL", 99)
         assert result == 42
-        assert mock_exec.call_count == 3
+        # Whitespace is now normalized at the start, so only exact + ilike attempts are needed.
+        assert mock_exec.call_count == 2
