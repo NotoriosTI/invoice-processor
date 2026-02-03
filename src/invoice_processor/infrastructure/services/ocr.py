@@ -188,15 +188,16 @@ class InvoiceOcrClient:
             # con descuento incluido; almacenamos calc_sub (sin descuento) para que
             # _apply_line_discounts lo aplique una sola vez.
             has_discount = descuento_pct is not None or bool(descuento_monto)
+            _sub_tol = max(1.0, abs(raw_sub) * 0.005) if raw_sub is not None else 1.0
             raw_matches_discounted = (
                 raw_sub is not None
                 and expected_discounted is not None
-                and abs(expected_discounted - raw_sub) <= 1.0
+                and abs(expected_discounted - raw_sub) <= _sub_tol
             )
             if has_discount and raw_matches_discounted:
                 # El OCR ya incluyó el descuento en raw_sub; guardamos el subtotal sin descuento.
                 cleaned_line["subtotal"] = calc_sub
-            elif raw_sub is not None and calc_sub is not None and abs(calc_sub - raw_sub) > 1.0 and not has_discount:
+            elif raw_sub is not None and calc_sub is not None and abs(calc_sub - raw_sub) > _sub_tol and not has_discount:
                 detail_label = cleaned_line.get("detalle") or line.get("detalle")
                 if detail_label:
                     warnings.append(
