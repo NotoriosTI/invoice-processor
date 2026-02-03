@@ -63,6 +63,11 @@ variables:
     type: str
     default: ""
 
+  XMLRPC_TIMEOUT_SECONDS:
+    source: XMLRPC_TIMEOUT_SECONDS
+    type: str
+    default: "30"
+
   EMBEDDING_CACHE_TTL_HOURS:
     source: EMBEDDING_CACHE_TTL_HOURS
     type: str
@@ -102,6 +107,7 @@ validation:
     - LANGSMITH_API_KEY
     - LANGSMITH_PROJECT
     - LANGSMITH_PROJECT_ID
+    - XMLRPC_TIMEOUT_SECONDS
     - EMBEDDING_CACHE_TTL_HOURS
     - ODOO_STOCK_LOCATION_MP_ME
     - ODOO_STOCK_LOCATION_DEFAULT

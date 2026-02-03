@@ -41,6 +41,10 @@ class Settings:
         )
         # Impuestos de compra por defecto (lista de IDs) si una línea no trae impuestos.
         self.default_purchase_tax_ids = get_config("DEFAULT_PURCHASE_TAX_IDS", "")
+        # Timeout para llamadas XML-RPC a Odoo (en segundos).
+        self.xmlrpc_timeout_seconds = int(
+            get_config("XMLRPC_TIMEOUT_SECONDS", "30")
+        )
         # TTL para la caché de embeddings de productos (en horas).
         self.embedding_cache_ttl_hours = float(
             get_config("EMBEDDING_CACHE_TTL_HOURS", "24")

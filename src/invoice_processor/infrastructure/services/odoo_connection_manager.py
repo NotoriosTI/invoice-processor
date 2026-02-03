@@ -5,6 +5,7 @@ import os
 import re
 import time
 import unicodedata
+import xmlrpc.client
 from difflib import SequenceMatcher
 from pathlib import Path
 from types import SimpleNamespace
@@ -531,32 +532,57 @@ class OdooConnectionManager:
             return product_id, score
         return product_id
 
+    _TRANSIENT_ERRORS = (ConnectionError, TimeoutError, OSError, xmlrpc.client.ProtocolError)
+    _MAX_RETRIES = 3
+    _RETRY_DELAYS = (1, 2, 4)  # seconds
+
     def _execute_kw(self, model, method, args=None, kwargs=None):
         """Atajo para llamar XML-RPC usando el product_client actual.
         Si es una lectura, aplana posibles listas anidadas de IDs para evitar errores de hash.
-        Ejecuta con timeout para evitar bloqueos indefinidos.
+        Ejecuta con timeout y retry con backoff exponencial para errores transitorios.
         """
         client = self.get_product_client()
         safe_args = args or []
         if method == "read" and safe_args and isinstance(safe_args[0], list):
             safe_args = [self._normalize_id_list(safe_args[0])] + list(safe_args[1:])
-        future = _xmlrpc_executor.submit(
-            client.models.execute_kw,
-            client.db,
-            client.uid,
-            client.password,
-            model,
-            method,
-            safe_args,
-            kwargs or {},
-        )
-        try:
-            return future.result(timeout=_XMLRPC_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise TimeoutError(
-                f"La llamada XML-RPC a Odoo ({model}.{method}) excedió el timeout de {_XMLRPC_TIMEOUT_SECONDS}s."
+        timeout = getattr(self._settings, "xmlrpc_timeout_seconds", _XMLRPC_TIMEOUT_SECONDS)
+
+        last_exc = None
+        for attempt in range(self._MAX_RETRIES):
+            future = _xmlrpc_executor.submit(
+                client.models.execute_kw,
+                client.db,
+                client.uid,
+                client.password,
+                model,
+                method,
+                safe_args,
+                kwargs or {},
             )
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                last_exc = TimeoutError(
+                    f"La llamada XML-RPC a Odoo ({model}.{method}) excedió el timeout de {timeout}s."
+                )
+            except xmlrpc.client.Fault:
+                raise  # Validation errors from Odoo should NOT be retried
+            except self._TRANSIENT_ERRORS as exc:
+                last_exc = exc
+            except Exception as exc:
+                # Unknown errors: don't retry
+                raise
+
+            if attempt < self._MAX_RETRIES - 1:
+                delay = self._RETRY_DELAYS[attempt] if attempt < len(self._RETRY_DELAYS) else self._RETRY_DELAYS[-1]
+                logger.warning(
+                    "XML-RPC %s.%s intento %d/%d falló (%s); reintentando en %ds…",
+                    model, method, attempt + 1, self._MAX_RETRIES, last_exc, delay,
+                )
+                time.sleep(delay)
+
+        raise last_exc
 
     @staticmethod
     def _build_or_domain(conditions: List[Tuple[str, str, Any]]) -> List[Any]:
