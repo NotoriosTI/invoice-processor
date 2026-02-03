@@ -3,6 +3,7 @@ import concurrent.futures
 import logging
 import os
 import re
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -335,6 +336,20 @@ class OdooConnectionManager:
             return self._embedding_cache_path
         return self._settings.data_path / f"product_embeddings_supplier_{supplier_id}.pkl"
 
+    def invalidate_product_embeddings(self, supplier_id: Optional[int] = None) -> None:
+        """Force regeneration of product embeddings by clearing in-memory and on-disk caches."""
+        cache_path = self._embedding_cache_path_for_supplier(supplier_id)
+        if cache_path.exists():
+            try:
+                cache_path.unlink()
+                logger.info("Caché de embeddings eliminada: %s", cache_path)
+            except Exception as exc:
+                logger.warning("No se pudo eliminar caché de embeddings: %s", exc)
+        if supplier_id is None:
+            self._product_embeddings_cache = None
+        else:
+            self._product_embeddings_cache_by_supplier.pop(int(supplier_id), None)
+
     def _refresh_product_embeddings(
         self,
         force: bool = False,
@@ -356,13 +371,22 @@ class OdooConnectionManager:
             return
 
         if not force:
-            cached = service.load_cache(cache_path)
-            if cached:
-                if resolved_supplier_id is None:
-                    self._product_embeddings_cache = cached
-                else:
-                    self._product_embeddings_cache_by_supplier[int(resolved_supplier_id)] = cached
-                return
+            # Check TTL on cached file
+            ttl_hours = getattr(self._settings, "embedding_cache_ttl_hours", 24)
+            cache_expired = False
+            if cache_path.exists():
+                age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
+                if age_hours > ttl_hours:
+                    cache_expired = True
+                    logger.info("Caché de embeddings expirada (%.1fh > %.1fh TTL): %s", age_hours, ttl_hours, cache_path)
+            if not cache_expired:
+                cached = service.load_cache(cache_path)
+                if cached:
+                    if resolved_supplier_id is None:
+                        self._product_embeddings_cache = cached
+                    else:
+                        self._product_embeddings_cache_by_supplier[int(resolved_supplier_id)] = cached
+                    return
 
         domain = None
         if resolved_supplier_id is not None:
@@ -1691,6 +1715,8 @@ class OdooConnectionManager:
         """Devuelve product_id mapeado por supplierinfo.product_name e ID de proveedor."""
         if not invoice_detail or supplier_id is None:
             return None
+        # Normalizar whitespace una vez al inicio para evitar intentos redundantes.
+        invoice_detail = re.sub(r"\s+", " ", invoice_detail.strip())
         fields = self._get_supplierinfo_fields()
         if "product_name" not in fields:
             return None
@@ -1729,23 +1755,6 @@ class OdooConnectionManager:
                 product_id = self._product_id_from_supplierinfo_record(records[0])
                 if product_id:
                     logger.info("Producto obtenido desde mapeo supplierinfo (ilike): %s -> product_id %s", invoice_detail, product_id)
-                return product_id
-
-        # Intento 3: normalizar whitespace e ilike
-        normalized_detail = re.sub(r"\s+", " ", invoice_detail.strip())
-        if normalized_detail != invoice_detail:
-            domain_norm = [supplier_domain, ["product_name", "ilike", normalized_detail]]
-            try:
-                records = self._execute_kw(
-                    "product.supplierinfo", "search_read", [domain_norm], {"fields": read_fields},
-                )
-            except Exception as exc:
-                logger.warning("No se pudo leer supplierinfo (normalized) para mapeo '%s': %s", normalized_detail, exc)
-                return None
-            if records:
-                product_id = self._product_id_from_supplierinfo_record(records[0])
-                if product_id:
-                    logger.info("Producto obtenido desde mapeo supplierinfo (normalized): %s -> product_id %s", normalized_detail, product_id)
                 return product_id
 
         return None
@@ -2010,6 +2019,23 @@ class OdooConnectionManager:
             product_id = _product_from_template(template_id)
             if product_id is not None:
                 return product_id
+
+        # 5) Fallback: buscar sin guiones/underscores (e.g. "MP-026" -> "MP026" y viceversa).
+        if default_code:
+            stripped_code = re.sub(r"[-_]", "", default_code)
+            if stripped_code != default_code:
+                stripped_domain = [["default_code", "=", stripped_code]]
+                found = _search(stripped_domain)
+                if found is not None:
+                    return found
+            # Intentar insertar guión si parece un código con letras+números (e.g. "MP026" -> "MP-026")
+            hyphenated = re.sub(r"^([A-Z]+)(\d)", r"\1-\2", default_code)
+            if hyphenated != default_code:
+                hyphen_domain = [["default_code", "=", hyphenated]]
+                found = _search(hyphen_domain)
+                if found is not None:
+                    return found
+
         return None
 
     def map_product_decision(self, invoice_product_name: str, odoo_product_id: Optional[int], supplier_id: int, default_code: Optional[str] = None) -> None:
@@ -2169,16 +2195,39 @@ class OdooConnectionManager:
                     exc,
                 )
             return int(selected)
+        # Validar datos antes de auto-crear proveedor.
+        if not supplier_label or supplier_label.lower() in {"proveedor desconocido", ""}:
+            raise RuntimeError(
+                "No se puede crear un proveedor sin nombre válido. Indica el proveedor correcto."
+            )
+        # Verificar unicidad de RUT antes de crear para evitar duplicados.
+        vat_to_store = canonical_rut or normalized_rut
+        if vat_to_store:
+            try:
+                existing_by_vat = self._execute_kw(
+                    "res.partner",
+                    "search_read",
+                    [[["vat", "ilike", vat_to_store]]],
+                    {"fields": ["id", "name", "vat"], "limit": 1},
+                )
+                if existing_by_vat:
+                    existing_id = self._normalize_id(existing_by_vat[0].get("id"))
+                    logger.info(
+                        "Proveedor existente encontrado por VAT '%s': ID %s (%s). No se creará duplicado.",
+                        vat_to_store, existing_id, existing_by_vat[0].get("name"),
+                    )
+                    return int(existing_id)
+            except Exception as exc:
+                logger.warning("No se pudo verificar unicidad de VAT '%s': %s", vat_to_store, exc)
+
         logger.info(
             "No se encontró proveedor para '%s'. Se creará automáticamente uno nuevo.",
             supplier_label,
         )
         try:
             values = {"name": supplier_label, "company_type": "company", "supplier_rank": 1}
-            if canonical_rut:
-                values["vat"] = canonical_rut
-            elif normalized_rut:
-                values["vat"] = normalized_rut
+            if vat_to_store:
+                values["vat"] = vat_to_store
             return self._execute_kw(
                 "res.partner",
                 "create",

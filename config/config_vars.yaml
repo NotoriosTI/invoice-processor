@@ -63,6 +63,11 @@ variables:
     type: str
     default: ""
 
+  EMBEDDING_CACHE_TTL_HOURS:
+    source: EMBEDDING_CACHE_TTL_HOURS
+    type: str
+    default: "24"
+
   ODOO_STOCK_LOCATION_MP_ME:
     source: ODOO_STOCK_LOCATION_MP_ME
     type: str
@@ -97,6 +102,7 @@ validation:
     - LANGSMITH_API_KEY
     - LANGSMITH_PROJECT
     - LANGSMITH_PROJECT_ID
+    - EMBEDDING_CACHE_TTL_HOURS
     - ODOO_STOCK_LOCATION_MP_ME
     - ODOO_STOCK_LOCATION_DEFAULT
   strict: false
