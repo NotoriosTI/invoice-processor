@@ -8,9 +8,15 @@ services:
       - "8000:8000"
     environment:
       # La aplicación buscará secretos en GCP
-      - SECRET_ORIGIN=gcp 
+      - SECRET_ORIGIN=gcp
       # El project ID sigue siendo necesario
       - GCP_PROJECT_ID=notorios
-    # No hay sección 'volumes' ni 'GOOGLE_APPLICATION_CREDENTIALS',
-    # permitiendo que la autenticación ocurra automáticamente a través 
+      - DATA_PATH=/app/data
+    volumes:
+      - invoice_data:/app/data
+    # No hay sección 'GOOGLE_APPLICATION_CREDENTIALS',
+    # permitiendo que la autenticación ocurra automáticamente a través
     # del Service Account de la VM.
+
+volumes:
+  invoice_data:

@@ -15,7 +15,7 @@ init_config(
     gcp_project_id=None,
     strict=None,
     dotenv_path=None,
-    debug=False,
+    debug=True,
 )
 
 DATA_PATH = Path(get_config("DATA_PATH"))
@@ -41,6 +41,21 @@ class Settings:
         )
         # Impuestos de compra por defecto (lista de IDs) si una línea no trae impuestos.
         self.default_purchase_tax_ids = get_config("DEFAULT_PURCHASE_TAX_IDS", "")
+        # Timeout para llamadas XML-RPC a Odoo (en segundos).
+        self.xmlrpc_timeout_seconds = int(
+            get_config("XMLRPC_TIMEOUT_SECONDS", "30")
+        )
+        # TTL para la caché de embeddings de productos (en horas).
+        self.embedding_cache_ttl_hours = float(
+            get_config("EMBEDDING_CACHE_TTL_HOURS", "24")
+        )
+        # Ubicaciones de stock para ruteo por prefijo SKU.
+        self.odoo_stock_location_mp_me = get_config(
+            "ODOO_STOCK_LOCATION_MP_ME", "JS/Stock/Materia Prima y Envases"
+        )
+        self.odoo_stock_location_default = get_config(
+            "ODOO_STOCK_LOCATION_DEFAULT", "JS/Stock"
+        )
         # LangSmith tracing (solo variables LANGSMITH_*)
         self.langsmith_tracing = get_config("LANGSMITH_TRACING", False)
         self.langsmith_endpoint = get_config("LANGSMITH_ENDPOINT", None)

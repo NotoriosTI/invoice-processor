@@ -3,7 +3,9 @@ import concurrent.futures
 import logging
 import os
 import re
+import time
 import unicodedata
+import xmlrpc.client
 from difflib import SequenceMatcher
 from pathlib import Path
 from types import SimpleNamespace
@@ -132,6 +134,7 @@ class OdooConnectionManager:
             return int(supplier_id)
         supplier_label = (supplier_name or "").strip()
         normalized_rut = self._normalize_vat_strict(supplier_rut)
+        canonical_rut = self._normalize_rut_cl(supplier_rut)
         raw_rut = supplier_rut.strip() if isinstance(supplier_rut, str) else None
 
         conditions: List[Tuple[str, str, Any]] = []
@@ -139,7 +142,9 @@ class OdooConnectionManager:
             conditions.append(("name", "ilike", supplier_label))
         if normalized_rut:
             conditions.append(("vat", "ilike", normalized_rut))
-        if raw_rut and raw_rut != normalized_rut:
+        if canonical_rut and canonical_rut != normalized_rut:
+            conditions.append(("vat", "ilike", canonical_rut))
+        if raw_rut and raw_rut != normalized_rut and raw_rut != canonical_rut:
             conditions.append(("vat", "ilike", raw_rut))
 
         if not conditions:
@@ -332,6 +337,20 @@ class OdooConnectionManager:
             return self._embedding_cache_path
         return self._settings.data_path / f"product_embeddings_supplier_{supplier_id}.pkl"
 
+    def invalidate_product_embeddings(self, supplier_id: Optional[int] = None) -> None:
+        """Force regeneration of product embeddings by clearing in-memory and on-disk caches."""
+        cache_path = self._embedding_cache_path_for_supplier(supplier_id)
+        if cache_path.exists():
+            try:
+                cache_path.unlink()
+                logger.info("Caché de embeddings eliminada: %s", cache_path)
+            except Exception as exc:
+                logger.warning("No se pudo eliminar caché de embeddings: %s", exc)
+        if supplier_id is None:
+            self._product_embeddings_cache = None
+        else:
+            self._product_embeddings_cache_by_supplier.pop(int(supplier_id), None)
+
     def _refresh_product_embeddings(
         self,
         force: bool = False,
@@ -353,13 +372,22 @@ class OdooConnectionManager:
             return
 
         if not force:
-            cached = service.load_cache(cache_path)
-            if cached:
-                if resolved_supplier_id is None:
-                    self._product_embeddings_cache = cached
-                else:
-                    self._product_embeddings_cache_by_supplier[int(resolved_supplier_id)] = cached
-                return
+            # Check TTL on cached file
+            ttl_hours = getattr(self._settings, "embedding_cache_ttl_hours", 24)
+            cache_expired = False
+            if cache_path.exists():
+                age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
+                if age_hours > ttl_hours:
+                    cache_expired = True
+                    logger.info("Caché de embeddings expirada (%.1fh > %.1fh TTL): %s", age_hours, ttl_hours, cache_path)
+            if not cache_expired:
+                cached = service.load_cache(cache_path)
+                if cached:
+                    if resolved_supplier_id is None:
+                        self._product_embeddings_cache = cached
+                    else:
+                        self._product_embeddings_cache_by_supplier[int(resolved_supplier_id)] = cached
+                    return
 
         domain = None
         if resolved_supplier_id is not None:
@@ -504,32 +532,57 @@ class OdooConnectionManager:
             return product_id, score
         return product_id
 
+    _TRANSIENT_ERRORS = (ConnectionError, TimeoutError, OSError, xmlrpc.client.ProtocolError)
+    _MAX_RETRIES = 3
+    _RETRY_DELAYS = (1, 2, 4)  # seconds
+
     def _execute_kw(self, model, method, args=None, kwargs=None):
         """Atajo para llamar XML-RPC usando el product_client actual.
         Si es una lectura, aplana posibles listas anidadas de IDs para evitar errores de hash.
-        Ejecuta con timeout para evitar bloqueos indefinidos.
+        Ejecuta con timeout y retry con backoff exponencial para errores transitorios.
         """
         client = self.get_product_client()
         safe_args = args or []
         if method == "read" and safe_args and isinstance(safe_args[0], list):
             safe_args = [self._normalize_id_list(safe_args[0])] + list(safe_args[1:])
-        future = _xmlrpc_executor.submit(
-            client.models.execute_kw,
-            client.db,
-            client.uid,
-            client.password,
-            model,
-            method,
-            safe_args,
-            kwargs or {},
-        )
-        try:
-            return future.result(timeout=_XMLRPC_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise TimeoutError(
-                f"La llamada XML-RPC a Odoo ({model}.{method}) excedió el timeout de {_XMLRPC_TIMEOUT_SECONDS}s."
+        timeout = getattr(self._settings, "xmlrpc_timeout_seconds", _XMLRPC_TIMEOUT_SECONDS)
+
+        last_exc = None
+        for attempt in range(self._MAX_RETRIES):
+            future = _xmlrpc_executor.submit(
+                client.models.execute_kw,
+                client.db,
+                client.uid,
+                client.password,
+                model,
+                method,
+                safe_args,
+                kwargs or {},
             )
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                last_exc = TimeoutError(
+                    f"La llamada XML-RPC a Odoo ({model}.{method}) excedió el timeout de {timeout}s."
+                )
+            except xmlrpc.client.Fault:
+                raise  # Validation errors from Odoo should NOT be retried
+            except self._TRANSIENT_ERRORS as exc:
+                last_exc = exc
+            except Exception as exc:
+                # Unknown errors: don't retry
+                raise
+
+            if attempt < self._MAX_RETRIES - 1:
+                delay = self._RETRY_DELAYS[attempt] if attempt < len(self._RETRY_DELAYS) else self._RETRY_DELAYS[-1]
+                logger.warning(
+                    "XML-RPC %s.%s intento %d/%d falló (%s); reintentando en %ds…",
+                    model, method, attempt + 1, self._MAX_RETRIES, last_exc, delay,
+                )
+                time.sleep(delay)
+
+        raise last_exc
 
     @staticmethod
     def _build_or_domain(conditions: List[Tuple[str, str, Any]]) -> List[Any]:
@@ -547,6 +600,21 @@ class OdooConnectionManager:
             cleaned = cleaned[2:]
         cleaned = "".join(ch for ch in cleaned if ch.isalnum())
         return cleaned or None
+
+    @staticmethod
+    def _normalize_rut_cl(vat: Optional[str]) -> Optional[str]:
+        """Normalizes a Chilean RUT to canonical format with hyphen before check digit (e.g. '12345678-9')."""
+        if not vat:
+            return None
+        cleaned = vat.strip().upper()
+        if cleaned.startswith("CL"):
+            cleaned = cleaned[2:]
+        cleaned = "".join(ch for ch in cleaned if ch.isalnum())
+        if not cleaned:
+            return None
+        if len(cleaned) >= 2:
+            return f"{cleaned[:-1]}-{cleaned[-1]}"
+        return cleaned
 
     def _normalize_vat(self, vat: Optional[str]) -> Optional[str]:
         return self._normalize_vat_strict(vat)
@@ -1673,31 +1741,49 @@ class OdooConnectionManager:
         """Devuelve product_id mapeado por supplierinfo.product_name e ID de proveedor."""
         if not invoice_detail or supplier_id is None:
             return None
+        # Normalizar whitespace una vez al inicio para evitar intentos redundantes.
+        invoice_detail = re.sub(r"\s+", " ", invoice_detail.strip())
         fields = self._get_supplierinfo_fields()
         if "product_name" not in fields:
             return None
         partner_field = self._supplierinfo_partner_field()
+        read_fields = ["id", partner_field, "product_name", self._supplierinfo_product_field()]
+        supplier_id_norm = self._normalize_id(supplier_id)
+        supplier_domain = [partner_field, "=", supplier_id_norm]
+
+        # Intento 1: match exacto (o ilike si partial=True)
         op = "ilike" if partial else "="
-        domain = [
-            [partner_field, "=", self._normalize_id(supplier_id)],
-            ["product_name", op, invoice_detail],
-        ]
+        domain = [supplier_domain, ["product_name", op, invoice_detail]]
         try:
             records = self._execute_kw(
-                "product.supplierinfo",
-                "search_read",
-                [domain],
-                {"fields": ["id", partner_field, "product_name", self._supplierinfo_product_field()]},
+                "product.supplierinfo", "search_read", [domain], {"fields": read_fields},
             )
         except Exception as exc:
             logger.warning("No se pudo leer supplierinfo para mapeo '%s': %s", invoice_detail, exc)
             return None
-        if not records:
-            return None
-        product_id = self._product_id_from_supplierinfo_record(records[0])
-        if product_id:
-            logger.info("Producto obtenido desde mapeo supplierinfo: %s -> product_id %s", invoice_detail, product_id)
-        return product_id
+        if records:
+            product_id = self._product_id_from_supplierinfo_record(records[0])
+            if product_id:
+                logger.info("Producto obtenido desde mapeo supplierinfo (exact): %s -> product_id %s", invoice_detail, product_id)
+            return product_id
+
+        # Intento 2: ilike (case-insensitive) si el primer intento fue exacto
+        if not partial:
+            domain_ilike = [supplier_domain, ["product_name", "ilike", invoice_detail]]
+            try:
+                records = self._execute_kw(
+                    "product.supplierinfo", "search_read", [domain_ilike], {"fields": read_fields},
+                )
+            except Exception as exc:
+                logger.warning("No se pudo leer supplierinfo (ilike) para mapeo '%s': %s", invoice_detail, exc)
+                return None
+            if records:
+                product_id = self._product_id_from_supplierinfo_record(records[0])
+                if product_id:
+                    logger.info("Producto obtenido desde mapeo supplierinfo (ilike): %s -> product_id %s", invoice_detail, product_id)
+                return product_id
+
+        return None
 
     def ensure_product_for_supplier(
         self,
@@ -1959,12 +2045,31 @@ class OdooConnectionManager:
             product_id = _product_from_template(template_id)
             if product_id is not None:
                 return product_id
+
+        # 5) Fallback: buscar sin guiones/underscores (e.g. "MP-026" -> "MP026" y viceversa).
+        if default_code:
+            stripped_code = re.sub(r"[-_]", "", default_code)
+            if stripped_code != default_code:
+                stripped_domain = [["default_code", "=", stripped_code]]
+                found = _search(stripped_domain)
+                if found is not None:
+                    return found
+            # Intentar insertar guión si parece un código con letras+números (e.g. "MP026" -> "MP-026")
+            hyphenated = re.sub(r"^([A-Z]+)(\d)", r"\1-\2", default_code)
+            if hyphenated != default_code:
+                hyphen_domain = [["default_code", "=", hyphenated]]
+                found = _search(hyphen_domain)
+                if found is not None:
+                    return found
+
         return None
 
     def map_product_decision(self, invoice_product_name: str, odoo_product_id: Optional[int], supplier_id: int, default_code: Optional[str] = None) -> None:
         """Registra la decisión humana asociando el detalle de factura a un product_id en supplierinfo."""
         if not invoice_product_name:
             raise ValueError("invoice_product_name es requerido para mapear el producto.")
+        # Normalizar whitespace para consistencia entre lo que se guarda y lo que se busca
+        invoice_product_name = re.sub(r"\s+", " ", invoice_product_name.strip())
         product_id = self._normalize_id(odoo_product_id) if odoo_product_id is not None else None
         supplier_id_norm = self._normalize_id(supplier_id)
         default_code = self._sanitize_default_code(default_code)
@@ -2050,13 +2155,16 @@ class OdooConnectionManager:
     def _find_or_create_supplier(self, supplier_name: str, supplier_rut: Optional[str] = None) -> int:
         supplier_label = (supplier_name or "Proveedor Desconocido").strip()
         normalized_rut = self._normalize_vat_strict(supplier_rut)
+        canonical_rut = self._normalize_rut_cl(supplier_rut)
         raw_rut = supplier_rut.strip() if isinstance(supplier_rut, str) else None
         conditions: List[Tuple[str, str, Any]] = []
         if supplier_label:
             conditions.append(("name", "ilike", supplier_label))
         if normalized_rut:
             conditions.append(("vat", "ilike", normalized_rut))
-        if raw_rut and raw_rut != normalized_rut:
+        if canonical_rut and canonical_rut != normalized_rut:
+            conditions.append(("vat", "ilike", canonical_rut))
+        if raw_rut and raw_rut != normalized_rut and raw_rut != canonical_rut:
             conditions.append(("vat", "ilike", raw_rut))
         domain = self._build_or_domain(conditions)
         try:
@@ -2113,14 +2221,39 @@ class OdooConnectionManager:
                     exc,
                 )
             return int(selected)
+        # Validar datos antes de auto-crear proveedor.
+        if not supplier_label or supplier_label.lower() in {"proveedor desconocido", ""}:
+            raise RuntimeError(
+                "No se puede crear un proveedor sin nombre válido. Indica el proveedor correcto."
+            )
+        # Verificar unicidad de RUT antes de crear para evitar duplicados.
+        vat_to_store = canonical_rut or normalized_rut
+        if vat_to_store:
+            try:
+                existing_by_vat = self._execute_kw(
+                    "res.partner",
+                    "search_read",
+                    [[["vat", "ilike", vat_to_store]]],
+                    {"fields": ["id", "name", "vat"], "limit": 1},
+                )
+                if existing_by_vat:
+                    existing_id = self._normalize_id(existing_by_vat[0].get("id"))
+                    logger.info(
+                        "Proveedor existente encontrado por VAT '%s': ID %s (%s). No se creará duplicado.",
+                        vat_to_store, existing_id, existing_by_vat[0].get("name"),
+                    )
+                    return int(existing_id)
+            except Exception as exc:
+                logger.warning("No se pudo verificar unicidad de VAT '%s': %s", vat_to_store, exc)
+
         logger.info(
             "No se encontró proveedor para '%s'. Se creará automáticamente uno nuevo.",
             supplier_label,
         )
         try:
             values = {"name": supplier_label, "company_type": "company", "supplier_rank": 1}
-            if normalized_rut:
-                values["vat"] = normalized_rut
+            if vat_to_store:
+                values["vat"] = vat_to_store
             return self._execute_kw(
                 "res.partner",
                 "create",
@@ -2147,6 +2280,9 @@ class OdooConnectionManager:
         def _create_lines_via_xmlrpc(order_id: int, lines_payload: List[dict]) -> None:
             for payload in lines_payload:
                 payload["order_id"] = order_id
+                raw_taxes = payload.get("taxes_id") or []
+                if raw_taxes and not (isinstance(raw_taxes[0], (list, tuple))):
+                    payload["taxes_id"] = [(6, 0, self._normalize_id_list(raw_taxes))]
                 self._execute_kw("purchase.order.line", "create", [[payload]])
 
         partner_id = self._find_or_create_supplier(invoice.supplier_name or "Proveedor Desconocido", getattr(invoice, "supplier_rut", None))
@@ -2217,7 +2353,15 @@ class OdooConnectionManager:
                     "order_line": [],
                 }
                 order_id = _create_order_via_xmlrpc(order_vals)
-                _create_lines_via_xmlrpc(order_id, line_values)
+                try:
+                    _create_lines_via_xmlrpc(order_id, line_values)
+                except Exception as lines_exc:
+                    logger.error("Fallo al crear líneas para orden %s; eliminando orden huérfana: %s", order_id, lines_exc)
+                    try:
+                        self._execute_kw("purchase.order", "unlink", [[order_id]])
+                    except Exception as unlink_exc:
+                        logger.warning("No se pudo eliminar la orden huérfana %s: %s", order_id, unlink_exc)
+                    raise
                 logger.info("Orden creada vía XML-RPC fallback (ID %s) tras fallo en OdooSupply.", order_id)
                 try:
                     order = self.confirm_purchase_order(order_id)
@@ -2243,8 +2387,8 @@ class OdooConnectionManager:
         picking_ids = self._normalize_id_list(order.get("picking_ids", []))
         if not picking_ids:
             return
-        dest_mp_me = self._get_location_id_by_name("JS/Stock/Materia Prima y Envases")
-        dest_pt = self._get_location_id_by_name("JS/Stock")
+        dest_mp_me = self._get_location_id_by_name(self._settings.odoo_stock_location_mp_me)
+        dest_pt = self._get_location_id_by_name(self._settings.odoo_stock_location_default)
         if dest_mp_me is None:
             raise RuntimeError(
                 "No se encontro la ubicacion 'JS/Stock/Materia Prima y Envases' en Odoo."
@@ -2352,7 +2496,7 @@ class OdooConnectionManager:
                 prod_id = self._normalize_id(mv.get("product_id"))
                 sku_raw = product_skus.get(prod_id)
                 sku_norm = self._sanitize_default_code(sku_raw) if sku_raw else None
-                if not sku_norm:
+                if not sku_norm or not isinstance(sku_norm, str):
                     logger.warning(
                         "Producto %s sin SKU; se usara destino JS/Stock.", prod_id
                     )
@@ -2533,10 +2677,38 @@ class OdooConnectionManager:
                     "No se pudo validar picking %s: %s", picking_id, exc
                 )
     
+    @staticmethod
+    def _normalize_date_for_odoo(date_str: str | None) -> str | None:
+        """Converts recognized date formats to YYYY-MM-DD for Odoo."""
+        if not date_str or not isinstance(date_str, str):
+            return None
+        date_str = date_str.strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        logger.warning("Fecha no parseable para Odoo: '%s'", date_str)
+        return None
+
     def create_invoice_for_order(
         self, order_id: int, ref: str | None = None, invoice_date: str | None = None
     ) -> dict:
         """Genera la factura desde la orden de compra, la publica con ref y fecha."""
+        # Verificar si la orden ya está facturada para evitar crear facturas duplicadas.
+        order_check = self._execute_kw(
+            "purchase.order", "read", [[order_id]], {"fields": ["invoice_status", "invoice_ids"]}
+        )
+        if order_check:
+            inv_status = str(order_check[0].get("invoice_status") or "").lower()
+            if inv_status in {"invoiced", "facturado"}:
+                existing = self._normalize_id_list(order_check[0].get("invoice_ids", []))
+                logger.info(
+                    "La orden %s ya está facturada (invoice_status=%s). Facturas existentes: %s",
+                    order_id, inv_status, existing,
+                )
+                return {"invoice_ids": existing, "posted": True}
+
         # Leer facturas existentes antes de crear
         order_before = self._execute_kw(
             "purchase.order", "read", [[order_id]], {"fields": ["invoice_ids"]}
@@ -2566,7 +2738,9 @@ class OdooConnectionManager:
             if ref:
                 vals["ref"] = ref
             if invoice_date:
-                vals["invoice_date"] = invoice_date
+                normalized_date = self._normalize_date_for_odoo(invoice_date)
+                if normalized_date:
+                    vals["invoice_date"] = normalized_date
             if vals:
                 try:
                     self._execute_kw("account.move", "write", [[inv_id], vals])

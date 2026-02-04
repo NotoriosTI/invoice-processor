@@ -11,7 +11,7 @@ INVOICE_OCR_PROMPT = (
     '  "total": number,\n'
     '  "descuento_global": number,\n'
     '  "lines": [\n'
-    '     {"detalle": string, "cantidad": number, "unidad": string|null, "precio_unitario": number, "subtotal": number, "descuento_pct": number|null, "descuento_monto": number|null}\n'
+    '     {"detalle": string, "cantidad": number, "unidad": string|null, "precio_unitario": number, "subtotal": number, "descuento_pct": number|null, "descuento_monto": number|null, "default_code": string|null}\n'
     "  ]\n"
     "}\n"
     "1. supplier_name es el nombre del proveedor tal como aparece en la factura; si no se lee, usa null. Lee el bloque de emisor/proveedor (razón social, RUT) y no inventes valores.\n"
@@ -25,4 +25,5 @@ INVOICE_OCR_PROMPT = (
     "9. Lee solo la tabla de la factura y descarta papeles, tickets u otros objetos visibles; si la imagen es ilegible, responde {'error': 'no_data'}.\n"
     "10. Captura el numero de folio (N° Folio, Folio, N° documento) en 'folio'. Si no se lee, usa null.\n"
     "11. Captura la fecha de emision en 'fecha_emision' con formato YYYY-MM-DD. Si no se lee, usa null.\n"
+    "12. Si la tabla muestra un codigo de producto (SKU, Codigo, Ref.), reportalo en 'default_code'. Si no aparece, usa null.\n"
 )
