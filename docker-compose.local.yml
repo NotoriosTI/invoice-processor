@@ -1,18 +1,23 @@
 services:
   invoice-processor:
     build: .
-    image: invoice-processor:latest 
+    image: invoice-processor:latest
     container_name: invoice-processor
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       # Env-manager usará esta variable para buscar secretos en GCP Secret Manager
-      - SECRET_ORIGIN=gcp 
+      - SECRET_ORIGIN=gcp
       - GCP_PROJECT_ID=notorios
       # Apunta a las credenciales ADC montadas para el desarrollo local
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp_adc.json
+      - DATA_PATH=/app/data
     volumes:
       # Monta el archivo de credenciales ADC local dentro del contenedor
       # Asegúrate de haber ejecutado 'gcloud auth application-default login' en tu máquina
       - ~/.config/gcloud/application_default_credentials.json:/app/gcp_adc.json:ro
+      - invoice_data_local:/app/data
+
+volumes:
+  invoice_data_local:

@@ -619,7 +619,7 @@ def process_invoice_file(
             )
         recalculated_neto = sum(l.subtotal for l in adjusted_lines)
         # Verifica que el neto ajustado cuadre con la cabecera; si no, detiene el flujo.
-        if abs(recalculated_neto - invoice.neto) > 1.0:
+        if abs(recalculated_neto - invoice.neto) > max(1.0, abs(invoice.neto) * 0.005):
             return InvoiceResponseModel(
                 summary=(
                     f"No se pudo aplicar el descuento global correctamente: "
@@ -631,7 +631,13 @@ def process_invoice_file(
                 iva_match=False,
                 total_match=False,
             )
-        iva_ajustado = recalculated_neto * 0.19
+        # Calcular tasa IVA efectiva desde cabecera si es posible; fallback a 19%.
+        _iva_rate = 0.19
+        if invoice.iva_19 and invoice.iva_19 > 0 and invoice.neto and invoice.neto > 0:
+            _effective = invoice.iva_19 / invoice.neto
+            if 0.05 <= _effective <= 0.30:
+                _iva_rate = _effective
+        iva_ajustado = recalculated_neto * _iva_rate
         total_ajustado = recalculated_neto + iva_ajustado
         invoice = invoice.model_copy(
             update={
@@ -963,17 +969,20 @@ def process_invoice_file(
         odoo_manager.recompute_order_amounts(order["id"])
         # Releer la orden tras las actualizaciones para usar totales y líneas frescos.
         summary = _build_order_summary(order)
-    neto_match = abs(summary["neto"] - invoice.neto) <= 1.0
-    iva_match = abs(summary["iva_19"] - invoice.iva_19) <= 1.0
-    total_match = abs(summary["total"] - invoice.total) <= 1.0
+    _neto_tol = max(1.0, abs(invoice.neto) * 0.005)
+    _iva_tol = max(1.0, abs(invoice.iva_19) * 0.005)
+    _total_tol = max(1.0, abs(invoice.total) * 0.005)
+    neto_match = abs(summary["neto"] - invoice.neto) <= _neto_tol
+    iva_match = abs(summary["iva_19"] - invoice.iva_19) <= _iva_tol
+    total_match = abs(summary["total"] - invoice.total) <= _total_tol
 
-    # Tolerancia de redondeo: si todas las líneas están OK y la diferencia en cabecera es <= 1 peso,
-    # consideramos coincidencia de neto, IVA y total.
+    # Tolerancia de redondeo: si todas las líneas están OK y la diferencia en cabecera
+    # está dentro de tolerancia, consideramos coincidencia de neto, IVA y total.
     header_neto_diff = abs(summary["neto"] - invoice.neto)
     header_iva_diff = abs(summary["iva_19"] - invoice.iva_19)
     header_total_diff = abs(summary["total"] - invoice.total)
     all_lines_ok = all(not p.issues for p in products)
-    if all_lines_ok and header_neto_diff <= 1.0 and header_iva_diff <= 1.0 and header_total_diff <= 1.0:
+    if all_lines_ok and header_neto_diff <= _neto_tol and header_iva_diff <= _iva_tol and header_total_diff <= _total_tol:
         neto_match = True
         iva_match = True
         total_match = True

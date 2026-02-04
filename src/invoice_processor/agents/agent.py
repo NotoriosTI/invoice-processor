@@ -1,7 +1,9 @@
+import sqlite3
+
 from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_openai import ChatOpenAI
-from ..config import get_settings
+from ..config import get_settings, DATA_PATH
 from ..core.models import InvoiceData, InvoiceResponseModel
 from ..tools.tools import parse_invoice_image, process_invoice_purchase_flow, map_product_decision_tool
 from ..tools.odoo_tools import (
@@ -20,9 +22,18 @@ tools = [
     finalize_invoice_workflow,
     receive_order_by_sku_prefix,
 ]
-checkpointer = MemorySaver()
+
+_db_path = DATA_PATH / "checkpoints.sqlite3"
+_db_path.parent.mkdir(parents=True, exist_ok=True)
+_conn = sqlite3.connect(str(_db_path), check_same_thread=False)
+checkpointer = SqliteSaver(_conn)
+checkpointer.setup()
+
 reader_tools = [parse_invoice_image]
-reader_checkpointer = MemorySaver()
+_reader_db_path = DATA_PATH / "reader_checkpoints.sqlite3"
+_reader_conn = sqlite3.connect(str(_reader_db_path), check_same_thread=False)
+reader_checkpointer = SqliteSaver(_reader_conn)
+reader_checkpointer.setup()
 
 def _get_llm():
     settings = get_settings()

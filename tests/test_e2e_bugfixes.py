@@ -812,10 +812,14 @@ class TestGapCreateInvoiceForOrder:
         def fake_execute_kw(model, method, args, kwargs=None):
             call_log.append((model, method))
             if model == "purchase.order" and method == "read":
-                # First call: before creating invoice
-                if len([c for c in call_log if c == ("purchase.order", "read")]) == 1:
+                read_count = len([c for c in call_log if c == ("purchase.order", "read")])
+                # First call: invoice_status check (P18)
+                if read_count == 1:
+                    return [{"invoice_status": "to invoice", "invoice_ids": [100]}]
+                # Second call: before creating invoice
+                if read_count == 2:
                     return [{"invoice_ids": [100]}]
-                # Second call: after creating invoice
+                # Third call: after creating invoice
                 return [{"invoice_ids": [100, 200]}]
             if model == "purchase.order" and method == "action_create_invoice":
                 return True
